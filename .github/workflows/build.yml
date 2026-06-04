@@ -7,12 +7,12 @@ on:
       kernel_branch:
         description: 'Branch kernel LineageOS (lihat langkah 4 jika bingung)'
         required: true
-        default: 'lineage-23.2'
+        default: 'lineage-21'
         type: choice
         options:
-          - lineage-23.2
-          - lineage-22.2
           - lineage-21
+          - lineage-22
+          - lineage-22.2
       sukisu_variant:
         description: 'Varian SuKiSu (susfs-main = lebih lengkap, main = dasar)'
         required: true
@@ -218,10 +218,47 @@ jobs:
           CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
           -j$(nproc) 2>&1 | tee build.log
 
-        # Verifikasi hasil
+        # Verifikasi hasil — jika gagal, tampilkan error asli
         echo ""
-        echo "Hasil kompilasi:"
-        ls -lh out/arch/arm64/boot/ || true
+        if [ ! -d "out/arch/arm64/boot" ] || \
+           ! ls out/arch/arm64/boot/Image* 2>/dev/null; then
+          echo "❌ Build GAGAL — kernel image tidak ditemukan"
+          echo ""
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "  ERROR UTAMA (baris pertama yang bermasalah):"
+          echo "╚══════════════════════════════════════════════════════╝"
+          # Cari error pertama dan tampilkan konteksnya (5 baris sebelum-sesudah)
+          ERRLINE=$(grep -n " error:" build.log | grep -v "Werror\|werror\|# error" \
+                    | head -1 | cut -d: -f1)
+          if [ -n "$ERRLINE" ]; then
+            START=$(( ERRLINE > 5 ? ERRLINE - 5 : 1 ))
+            END=$(( ERRLINE + 15 ))
+            echo "--- Sekitar baris $ERRLINE ---"
+            sed -n "${START},${END}p" build.log
+          else
+            echo "(grep 'error:' tidak ketemu — coba pola lain)"
+            grep -i "fatal\|undefined reference\|cannot find\|ld.lld\|linker" \
+              build.log | head -20 || true
+            echo ""
+            echo "--- 80 baris terakhir build.log ---"
+            tail -80 build.log
+          fi
+          exit 1
+        fi
+
+        echo "✅ Hasil build:"
+        ls -lh out/arch/arm64/boot/
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAHAP 7b: Selalu upload build.log (berguna untuk debug)
+    # ─────────────────────────────────────────────────────────────────────
+    - name: 📋 Upload build.log (untuk debug)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: kernel/build.log
+        retention-days: 3
 
     # ─────────────────────────────────────────────────────────────────────
     # TAHAP 8: Buat file ZIP yang bisa di-flash via TWRP
