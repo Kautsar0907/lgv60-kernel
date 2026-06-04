@@ -7,12 +7,12 @@ on:
       kernel_branch:
         description: 'Branch kernel LineageOS (lihat langkah 4 jika bingung)'
         required: true
-        default: 'lineage-23.2'
+        default: 'lineage-21'
         type: choice
         options:
-          - lineage-23.2
-          - lineage-22.2
           - lineage-21
+          - lineage-22
+          - lineage-22.2
       sukisu_variant:
         description: 'Varian SuKiSu (susfs-main = lebih lengkap, main = dasar)'
         required: true
