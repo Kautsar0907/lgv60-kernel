@@ -10,10 +10,8 @@ import os
 import sys
 import shutil
 
-# Ambil path kernel dari argumen
 KERNEL_DIR = sys.argv[1] if len(sys.argv) > 1 else "."
 
-# Counter & tracking
 hasil = {"berhasil": 0, "sudah_ada": 0, "gagal": 0}
 failed_files = []
 
@@ -22,11 +20,9 @@ failed_files = []
 # ─────────────────────────────────────────────────────────────
 
 def path(relative):
-    """Gabungkan kernel dir dengan path relatif."""
     return os.path.join(KERNEL_DIR, relative)
 
 def baca(file_rel):
-    """Baca file, return None jika tidak ada."""
     p = path(file_rel)
     try:
         with open(p, "r", encoding="utf-8", errors="replace") as f:
@@ -41,25 +37,19 @@ def baca(file_rel):
         return None
 
 def tulis(file_rel, konten):
-    """Tulis konten ke file dengan backup."""
     p = path(file_rel)
-    
-    # Backup file asli
     if os.path.exists(p):
         backup = p + ".bak"
         shutil.copy2(p, backup)
-    
     try:
         with open(p, "w", encoding="utf-8") as f:
             f.write(konten)
     except Exception as e:
-        # Restore backup jika gagal
         if os.path.exists(p + ".bak"):
             shutil.move(p + ".bak", p)
         raise e
 
 def sudah_dipatch(konten, marker):
-    """Cek marker unik (lebih spesifik dari global CONFIG_KSU)."""
     return konten is not None and marker in konten
 
 def log_ok(msg):
@@ -84,8 +74,7 @@ def patch_exec_c():
     FILE = "fs/exec.c"
     c = baca(FILE)
     if c is None: return
-    
-    # Cek dengan marker unik
+
     if sudah_dipatch(c, "ksu_execveat_hook"):
         log_skip(FILE)
         return
@@ -120,8 +109,11 @@ def patch_exec_c():
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
     berhasil = False
-    for anchor in ["return __do_execve_file(", "\t__do_execve_file("]:
+    # FIX: Sertakan leading \t pada anchor agar tab dikonsumsi oleh replace,
+    # menghindari orphaned \t sebelum HOOK di baris sebelumnya.
+    for anchor in ["\treturn __do_execve_file(", "\t__do_execve_file("]:
         if anchor in c:
+            # anchor.lstrip() mengkonsumsi tab; HOOK berakhir \t untuk re-indent
             c = c.replace(anchor, HOOK + anchor.lstrip(), 1)
             berhasil = True
             break
@@ -141,7 +133,7 @@ def patch_open_c():
     FILE = "fs/open.c"
     c = baca(FILE)
     if c is None: return
-    
+
     if sudah_dipatch(c, "ksu_handle_faccessat"):
         log_skip(FILE)
         return
@@ -153,12 +145,13 @@ def patch_open_c():
         "                               int *mode, int *flags);\n"
         "#endif\n"
     )
-    
+
+    # FIX: HOOK tidak lagi berakhir dengan "\t" — penggabungan dengan anchor
+    # yang sudah memiliki indentasinya sendiri.
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
         "#endif\n"
-        "\t"
     )
 
     FUNGSI_TARGET = None
@@ -174,9 +167,11 @@ def patch_open_c():
 
     c = c.replace(FUNGSI_TARGET, DEKLARASI + FUNGSI_TARGET, 1)
 
+    # FIX: Hapus "\t" + prefix pada HOOK — #ifdef harus di kolom 0.
+    # Anchor sudah mengandung leading \t miliknya sendiri.
     for anchor in ["\tif (mode & ~S_IRWXO)", "\tunsigned int lookup_flags = LOOKUP_FOLLOW;"]:
         if anchor in c:
-            c = c.replace(anchor, "\t" + HOOK.rstrip() + "\n" + anchor, 1)
+            c = c.replace(anchor, HOOK + anchor, 1)
             tulis(FILE, c)
             log_ok(FILE)
             return
@@ -191,7 +186,7 @@ def patch_read_write_c():
     FILE = "fs/read_write.c"
     c = baca(FILE)
     if c is None: return
-    
+
     if sudah_dipatch(c, "ksu_vfs_read_hook"):
         log_skip(FILE)
         return
@@ -204,13 +199,13 @@ def patch_read_write_c():
         "                               size_t *count_ptr, loff_t **pos);\n"
         "#endif\n"
     )
-    
+
+    # FIX: Hapus trailing "\t" dari HOOK; anchor sudah memiliki indentasinya.
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tif (unlikely(ksu_vfs_read_hook))\n"
         "\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n"
         "#endif\n"
-        "\t"
     )
 
     FUNGSI = "ssize_t vfs_read("
@@ -221,9 +216,10 @@ def patch_read_write_c():
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
+    # FIX: Hapus "\t" + prefix; anchor sudah memiliki leading \t.
     ANCHOR = "\tif (!(file->f_mode & FMODE_READ))"
     if ANCHOR in c:
-        c = c.replace(ANCHOR, "\t" + HOOK.rstrip() + "\n" + ANCHOR, 1)
+        c = c.replace(ANCHOR, HOOK + ANCHOR, 1)
         tulis(FILE, c)
         log_ok(FILE)
         return
@@ -238,7 +234,7 @@ def patch_stat_c():
     FILE = "fs/stat.c"
     c = baca(FILE)
     if c is None: return
-    
+
     if sudah_dipatch(c, "ksu_handle_stat"):
         log_skip(FILE)
         return
@@ -251,30 +247,43 @@ def patch_stat_c():
         "#endif\n"
     )
 
+    # FIX: Insert DEKLARASI sekali di luar loop untuk menghindari duplikasi.
+    # Jika vfs_statx ditemukan tapi anchor-nya tidak ada, lalu vfs_fstatat juga
+    # ditemukan, DEKLARASI tidak akan di-insert dua kali.
+    fungsi_anchor = None
     for fungsi, var_flags in [
         ("int vfs_statx(", "&flags"),
         ("int vfs_fstatat(", "&flag"),
     ]:
-        if fungsi not in c:
-            continue
+        if fungsi in c:
+            fungsi_anchor = (fungsi, var_flags)
+            break
 
-        HOOK = (
-            "#ifdef CONFIG_KSU\n"
-            f"\tksu_handle_stat(&dfd, &filename, {var_flags});\n"
-            "#endif\n"
-            "\t"
-        )
+    if fungsi_anchor is None:
+        log_gagal(f"{FILE}: fungsi vfs_statx/vfs_fstatat tidak ditemukan")
+        failed_files.append(FILE)
+        return
 
-        c = c.replace(fungsi, DEKLARASI + fungsi, 1)
+    fungsi, var_flags = fungsi_anchor
 
-        for anchor in ["\tint error = -EINVAL;\n", "\tunsigned int lookup_flags"]:
-            if anchor in c:
-                c = c.replace(anchor, anchor + "\t" + HOOK.rstrip() + "\n", 1)
-                tulis(FILE, c)
-                log_ok(FILE)
-                return
+    HOOK = (
+        "#ifdef CONFIG_KSU\n"
+        f"\tksu_handle_stat(&dfd, &filename, {var_flags});\n"
+        "#endif\n"
+    )
 
-    log_gagal(f"{FILE}: fungsi vfs_statx/vfs_fstatat tidak ditemukan")
+    # Insert DEKLARASI tepat sekali, sebelum fungsi yang ditemukan
+    c = c.replace(fungsi, DEKLARASI + fungsi, 1)
+
+    # FIX: Hapus "\t" + prefix; anchor sudah memiliki leading \t.
+    for anchor in ["\tint error = -EINVAL;\n", "\tunsigned int lookup_flags"]:
+        if anchor in c:
+            c = c.replace(anchor, HOOK + anchor, 1)
+            tulis(FILE, c)
+            log_ok(FILE)
+            return
+
+    log_gagal(f"{FILE}: titik insert tidak ditemukan setelah {fungsi}")
     failed_files.append(FILE)
 
 # ─────────────────────────────────────────────────────────────
@@ -284,7 +293,7 @@ def patch_input_c():
     FILE = "drivers/input/input.c"
     c = baca(FILE)
     if c is None: return
-    
+
     if sudah_dipatch(c, "ksu_input_hook"):
         log_skip(FILE)
         return
@@ -297,13 +306,13 @@ def patch_input_c():
         "                                          unsigned int *code, int *value);\n"
         "#endif\n"
     )
-    
+
+    # FIX: Hapus trailing "\t"; anchor sudah memiliki indentasinya.
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tif (unlikely(ksu_input_hook))\n"
         "\t\tksu_handle_input_handle_event(&type, &code, &value);\n"
         "#endif\n"
-        "\t"
     )
 
     FUNGSI = "static void input_handle_event("
@@ -314,9 +323,10 @@ def patch_input_c():
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
+    # FIX: Hapus "\t" + prefix.
     for anchor in ["\tif (disposition != INPUT_IGNORE_EVENT", "\tswitch (disposition)"]:
         if anchor in c:
-            c = c.replace(anchor, "\t" + HOOK.rstrip() + "\n" + anchor, 1)
+            c = c.replace(anchor, HOOK + anchor, 1)
             tulis(FILE, c)
             log_ok(FILE)
             return
@@ -331,7 +341,7 @@ def patch_devpts_c():
     FILE = "fs/devpts/inode.c"
     c = baca(FILE)
     if c is None: return
-    
+
     if sudah_dipatch(c, "ksu_handle_devpts"):
         log_skip(FILE)
         return
@@ -342,12 +352,12 @@ def patch_devpts_c():
         "extern int ksu_handle_devpts(struct inode*);\n"
         "#endif\n"
     )
-    
+
+    # FIX: Hapus trailing "\t"; anchor sudah memiliki indentasinya.
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_devpts(dentry->d_inode);\n"
         "#endif\n"
-        "\t"
     )
 
     FUNGSI = "void *devpts_get_priv("
@@ -358,9 +368,10 @@ def patch_devpts_c():
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
+    # FIX: Hapus "\t" + prefix.
     ANCHOR = "\tif (dentry->d_sb->s_magic != DEVPTS_SUPER_MAGIC)"
     if ANCHOR in c:
-        c = c.replace(ANCHOR, "\t" + HOOK.rstrip() + "\n" + ANCHOR, 1)
+        c = c.replace(ANCHOR, HOOK + ANCHOR, 1)
         tulis(FILE, c)
         log_ok(FILE)
         return
@@ -380,7 +391,14 @@ def patch_namespace_c():
         log_skip(f"{FILE} (path_umount sudah ada)")
         return
 
+    # FIX: Bungkus seluruh backport dengan #ifdef CONFIG_KSU sehingga fungsi
+    # hanya dikompilasi ketika KSU aktif. Tanpa guard, can_umount() dan
+    # path_umount() selalu masuk ke binary, membuang ukuran dan berisiko
+    # konflik di masa depan.
+    # FIX: Tambahkan EXPORT_SYMBOL_GPL agar KernelSU dapat menggunakan extern
+    # path_umount() tanpa linker error bila suatu saat dibangun sebagai module.
     PATH_UMOUNT_CODE = """
+#ifdef CONFIG_KSU
 /* KernelSU: backport path_umount dari kernel yang lebih baru */
 static int can_umount(const struct path *path, int flags)
 {
@@ -414,6 +432,8 @@ int path_umount(struct path *path, int flags)
 \tmntput_no_expire(mnt);
 \treturn ret;
 }
+EXPORT_SYMBOL_GPL(path_umount);
+#endif /* CONFIG_KSU */
 
 """
 
@@ -452,15 +472,14 @@ if __name__ == "__main__":
     print()
 
     CRITICAL_FILES = ["fs/exec.c", "fs/open.c", "drivers/input/input.c"]
-    
+
     if hasil["gagal"] > 0:
         print("⚠️  Ada patch yang gagal:")
         for f in failed_files:
             is_critical = f in CRITICAL_FILES
             marker = "🔴 CRITICAL" if is_critical else "⚠️  OPTIONAL"
             print(f"   {marker}: {f}")
-        
-        # Exit 1 jika ada critical file yang gagal
+
         critical_failed = any(f in CRITICAL_FILES for f in failed_files)
         if critical_failed:
             print()
