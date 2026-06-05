@@ -1,4 +1,4 @@
-name: "U0001F528 Build LG V60 Kernel + SukiSU Ultra"
+name: 🔨 Build LG V60 Kernel + SukiSU Ultra
 
 on:
   workflow_dispatch:
@@ -33,10 +33,10 @@ jobs:
     # STEP 1: Setup Environment
     # ══════════════════════════════════════════════════════════
 
-    - name: "U0001F4E5 Checkout repository"
+    - name: 📥 Checkout repository
       uses: actions/checkout@v4
 
-    - name: "U0001F5D1️ Free up disk space"
+    - name: 🗑️ Free up disk space
       run: |
         echo "Disk sebelum cleanup:"
         df -h / | tail -1
@@ -53,7 +53,7 @@ jobs:
         echo "Disk setelah cleanup:"
         df -h / | tail -1
 
-    - name: "U0001F4E6 Install build dependencies"
+    - name: 📦 Install build dependencies
       run: |
         sudo apt-get update -y
         sudo apt-get install -y \
@@ -63,7 +63,7 @@ jobs:
           gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
           binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
-    - name: "⚙️ Install Clang 17"
+    - name: ⚙️ Install Clang 17
       run: |
         wget -q https://apt.llvm.org/llvm.sh -O llvm.sh
         chmod +x llvm.sh
@@ -82,7 +82,7 @@ jobs:
     # STEP 2: Clone Kernel Source
     # ══════════════════════════════════════════════════════════
 
-    - name: "U0001F4E5 Clone kernel source"
+    - name: 📥 Clone kernel source
       run: |
         git clone --depth=1 \
           https://github.com/LineageOS/android_kernel_lge_sm8250 \
@@ -94,19 +94,10 @@ jobs:
         echo ""
 
     # ══════════════════════════════════════════════════════════
-    # STEP 3: Inject SukiSU Ultra
-    #
-    # FIX #2: Ganti symlink → cp -r (hardcopy)
-    #   Symlink (bahkan absolute) bisa menyebabkan Kbuild salah resolve
-    #   path di beberapa versi Android kernel fork. Hardcopy adalah
-    #   pendekatan paling robust dan direkomendasikan oleh KernelSU docs.
-    #
-    # FIX #4: Validasi struktur SukiSU SEBELUM integrasi.
-    #   Fail fast dengan pesan yang jelas jika repo tidak punya
-    #   Makefile/Kconfig di path yang diexpect.
+    # STEP 3: Clone SukiSU Ultra
     # ══════════════════════════════════════════════════════════
 
-    - name: "U0001F489 Clone & integrate SukiSU Ultra source"
+    - name: 💉 Clone SukiSU Ultra source
       run: |
         cd kernel
 
@@ -117,13 +108,12 @@ jobs:
           exit 1
         fi
 
-        # ── FIX #4: Validasi struktur repo SukiSU ──────────────
         echo ""
         echo "▶ Validating SukiSU repo structure..."
-        echo "   Full SukiSU root contents:"
+        echo "   SukiSU root contents:"
         ls -la SukiSU/
 
-        # Cari direktori yang berisi Kconfig (bisa di root atau subdir)
+        # Auto-detect direktori kernel SukiSU
         SUKISU_KERNEL_DIR=""
         for candidate in "SukiSU/kernel" "SukiSU" "SukiSU/KernelSU/kernel"; do
           if [ -f "${candidate}/Kconfig" ] && [ -f "${candidate}/Makefile" ]; then
@@ -134,71 +124,134 @@ jobs:
         done
 
         if [ -z "$SUKISU_KERNEL_DIR" ]; then
-          echo ""
-          echo "❌ GAGAL: Tidak dapat menemukan Kconfig + Makefile di repo SukiSU!"
-          echo "   Struktur repo yang ditemukan:"
+          echo "❌ Tidak dapat menemukan Kconfig + Makefile di repo SukiSU!"
           find SukiSU -name 'Kconfig' -o -name 'Makefile' | head -20
-          echo ""
-          echo "   Isi direktori SukiSU/:"
           ls -la SukiSU/
-          if [ -d "SukiSU/kernel" ]; then
-            echo "   Isi SukiSU/kernel/:"
-            ls -la SukiSU/kernel/
-          fi
+          [ -d "SukiSU/kernel" ] && ls -la SukiSU/kernel/
           exit 1
         fi
 
-        echo "   C files in SukiSU kernel dir:"
-        ls "${SUKISU_KERNEL_DIR}"/*.c 2>/dev/null | head -10 || echo "   (no .c files at root, may be in subdirs)"
+        # Tampilkan struktur untuk verifikasi
+        echo "   .c files:"
+        ls "${SUKISU_KERNEL_DIR}"/*.c 2>/dev/null | head -5 \
+          || find "${SUKISU_KERNEL_DIR}" -name '*.c' | head -5
 
-        # ── FIX #2: Hardcopy (cp -r) bukan symlink ─────────────
+        # ── Hardcopy (cp -r) — bukan symlink ──────────────────
         echo ""
-        echo "▶ Copying SukiSU kernel dir to drivers/kernelsu/ (FIX #2: hardcopy)..."
+        echo "▶ Copying SukiSU → drivers/kernelsu/ (hardcopy)..."
         cp -r "${SUKISU_KERNEL_DIR}" drivers/kernelsu
 
-        # Verifikasi hasil copy
-        if [ ! -d drivers/kernelsu ]; then
-          echo "❌ Hardcopy gagal — drivers/kernelsu tidak ada!"
-          exit 1
-        fi
-        if [ ! -f drivers/kernelsu/Kconfig ]; then
-          echo "❌ Hardcopy OK tapi Kconfig tidak ada di drivers/kernelsu/!"
-          ls -la drivers/kernelsu/
-          exit 1
-        fi
-        if [ ! -f drivers/kernelsu/Makefile ]; then
-          echo "❌ Hardcopy OK tapi Makefile tidak ada di drivers/kernelsu/!"
-          ls -la drivers/kernelsu/
+        if [ ! -d drivers/kernelsu ] || \
+           [ ! -f drivers/kernelsu/Kconfig ] || \
+           [ ! -f drivers/kernelsu/Makefile ]; then
+          echo "❌ Hardcopy gagal atau struktur tidak lengkap!"
+          ls -la drivers/kernelsu/ 2>/dev/null || echo "  direktori tidak ada"
           exit 1
         fi
 
-        echo "✅ drivers/kernelsu/ ready:"
+        echo "✅ drivers/kernelsu/ ready"
         ls -la drivers/kernelsu/ | head -20
 
-    # ── Integrate into build system ────────────────────────────
-    - name: "U0001F527 Integrate SukiSU into build system"
+    # ══════════════════════════════════════════════════════════
+    # STEP 4: Integrate SukiSU into Build System
+    #
+    # FIX #MAIN (v4): Inject ccflags-y ke Makefile SukiSU
+    #   ROOT CAUSE: #include "uapi/feature.h" di policy/feature.h
+    #   mencari file relatif terhadap drivers/kernelsu/policy/uapi/
+    #   tapi file sebenarnya ada di drivers/kernelsu/uapi/
+    #   FIX: Tambah -I$(srctree)/drivers/kernelsu ke ccflags-y
+    #   sehingga compiler tahu harus mencari dari drivers/kernelsu/
+    #   sebagai root, dan "uapi/feature.h" → kernelsu/uapi/feature.h ✅
+    #
+    # FIX #1 (v3): obj-$(CONFIG_KSU) bukan obj-y
+    # ══════════════════════════════════════════════════════════
+
+    - name: 🔧 Integrate SukiSU into build system
       run: |
         cd kernel
 
-        echo "▶ Patching drivers/Makefile..."
-        # ── FIX #1: Gunakan obj-$(CONFIG_KSU) bukan obj-y ──────
-        # obj-y = SELALU build direktori ini (bahkan jika KSU=n → error!)
-        # obj-$(CONFIG_KSU) = hanya build jika CONFIG_KSU=y atau =m
-        # Ini adalah ROOT CAUSE utama dari "Makefile:1892 Error 2"!
-        if ! grep -q 'kernelsu' drivers/Makefile; then
-          # FIX #1: obj-$(CONFIG_KSU) bukan obj-y
-          echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-          echo "  ✅ Added: obj-$(CONFIG_KSU) += kernelsu/ (FIX #1)"
+        # ══════════════════════════════════════════════════════
+        # FIX #MAIN: Inject ccflags-y untuk fix uapi header path
+        # ══════════════════════════════════════════════════════
+        echo "▶ [FIX #MAIN] Patching ccflags-y di drivers/kernelsu/Makefile..."
+        echo "  Root cause: policy/feature.h dan policy/allowlist.h menggunakan"
+        echo "  #include "uapi/feature.h" yang dicari relatif terhadap policy/"
+        echo "  tapi file ada di kernelsu/uapi/ — perlu tambah include path root."
+        echo ""
+
+        KERNELSU_MK="drivers/kernelsu/Makefile"
+
+        # Tampilkan Makefile asli SukiSU untuk verifikasi
+        echo "  Makefile SukiSU SEBELUM patch:"
+        cat "$KERNELSU_MK"
+        echo "  ─────────────────────────────"
+
+        # Cek apakah ccflags sudah ada dan sudah benar
+        CCFLAG_LINE='ccflags-y += -I$(srctree)/drivers/kernelsu'
+        if grep -qF 'ccflags-y' "$KERNELSU_MK"; then
+          if grep -qF "$(srctree)/drivers/kernelsu" "$KERNELSU_MK"; then
+            echo "  ✅ ccflags-y sudah ada dan sudah benar — skip inject"
+          else
+            # Ada ccflags tapi path berbeda — tambahkan path kita
+            echo "$CCFLAG_LINE" >> "$KERNELSU_MK"
+            echo "  ✅ ccflags-y ada tapi path berbeda — appended: $CCFLAG_LINE"
+          fi
         else
-          # Jika sudah ada tapi masih obj-y, fix ke obj-$(CONFIG_KSU)
+          # Tidak ada ccflags sama sekali — inject di baris pertama
+          # Gunakan sed untuk insert di baris pertama agar tidak mengganggu
+          # existing Makefile structure (obj-y lines, subdir, dll)
+          sed -i "1s|^|$CCFLAG_LINE\n|" "$KERNELSU_MK"
+          echo "  ✅ Injected ccflags-y at line 1: $CCFLAG_LINE"
+        fi
+
+        echo ""
+        echo "  Makefile SukiSU SETELAH patch:"
+        head -10 "$KERNELSU_MK"
+        echo "  ─────────────────────────────"
+
+        # Verifikasi uapi directory ada
+        echo ""
+        echo "▶ Verifying uapi/ directory structure..."
+        if [ -d "drivers/kernelsu/uapi" ]; then
+          echo "  ✅ drivers/kernelsu/uapi/ EXISTS"
+          ls drivers/kernelsu/uapi/
+          # Cek file kritis
+          for hdr in "feature.h" "app_profile.h"; do
+            if [ -f "drivers/kernelsu/uapi/$hdr" ]; then
+              echo "  ✅ uapi/$hdr → OK"
+            else
+              echo "  ⚠️  uapi/$hdr → NOT FOUND (mungkin nama berbeda)"
+            fi
+          done
+        else
+          echo "  ⚠️  drivers/kernelsu/uapi/ TIDAK ADA"
+          echo "     Struktur aktual kernelsu/:"
+          find drivers/kernelsu -name '*.h' | head -20
+          echo ""
+          echo "  WARNING: ccflags-y sudah di-inject tapi jika uapi/ tidak ada,"
+          echo "  error yang sama akan tetap terjadi."
+          echo "  Cek apakah repo SukiSU menggunakan struktur header yang berbeda."
+        fi
+
+        # ══════════════════════════════════════════════════════
+        # FIX #1 (v3): obj-$(CONFIG_KSU) bukan obj-y
+        # ══════════════════════════════════════════════════════
+        echo ""
+        echo "▶ [FIX #1] Patching drivers/Makefile (obj-$(CONFIG_KSU))..."
+        if ! grep -q 'kernelsu' drivers/Makefile; then
+          echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          echo "  ✅ Added: obj-$(CONFIG_KSU) += kernelsu/"
+        else
           if grep -q 'obj-y += kernelsu/' drivers/Makefile; then
             sed -i 's|obj-y += kernelsu/|obj-$(CONFIG_KSU) += kernelsu/|g' drivers/Makefile
-            echo "  ✅ Fixed: obj-y → obj-$(CONFIG_KSU) in Makefile (FIX #1)"
+            echo "  ✅ Fixed: obj-y → obj-$(CONFIG_KSU)"
           else
-            echo "  ⏭️  kernelsu sudah ada di Makefile"
+            echo "  ⏭️  kernelsu entry sudah ada di drivers/Makefile"
+            grep 'kernelsu' drivers/Makefile
           fi
         fi
 
+        echo ""
         echo "▶ Patching drivers/Kconfig..."
         if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
           if grep -q '^endmenu' drivers/Kconfig; then
@@ -212,39 +265,36 @@ jobs:
           echo "  ⏭️  kernelsu sudah ada di Kconfig"
         fi
 
+        # Summary integrasi
         echo ""
-        echo "Verifikasi integrasi:"
-        echo "  Makefile entry : $(grep 'kernelsu' drivers/Makefile)"
-        echo "  Kconfig entry  : $(grep 'kernelsu' drivers/Kconfig)"
-
-        # ── Preview Makefile SukiSU untuk deteksi dini masalah ──
-        echo ""
-        echo "▶ Preview drivers/kernelsu/Makefile (10 baris pertama):"
-        head -10 drivers/kernelsu/Makefile || echo "  (tidak bisa dibaca)"
-
-        echo ""
-        echo "▶ CONFIG_KSU di Kconfig SukiSU:"
-        grep -A 8 'config KSU' drivers/kernelsu/Kconfig || echo "  (tidak ditemukan)"
+        echo "════════ Integration Summary ════════"
+        echo "drivers/Makefile:"
+        grep 'kernelsu' drivers/Makefile || echo "  (tidak ada entry)"
+        echo "drivers/Kconfig:"
+        grep 'kernelsu' drivers/Kconfig  || echo "  (tidak ada entry)"
+        echo "drivers/kernelsu/Makefile (5 baris pertama):"
+        head -5 drivers/kernelsu/Makefile
+        echo "config KSU in Kconfig:"
+        grep -A 6 '^config KSU$' drivers/kernelsu/Kconfig || echo "  (tidak ditemukan)"
+        echo "═════════════════════════════════════"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 4: Apply Manual Hooks
+    # STEP 5: Apply Manual Hooks
     # ══════════════════════════════════════════════════════════
 
-    - name: "U0001F527 Apply kernel hooks"
+    - name: 🔧 Apply kernel hooks
       run: |
-        echo "▶ Running apply_hooks.py..."
         SCRIPT="$GITHUB_WORKSPACE/scripts/apply_hooks.py"
         KERNEL_DIR="$GITHUB_WORKSPACE/kernel"
 
         if [ ! -f "$SCRIPT" ]; then
-          echo "❌ apply_hooks.py tidak ditemukan di: $SCRIPT"
+          echo "❌ apply_hooks.py tidak ditemukan: $SCRIPT"
           exit 1
         fi
 
+        echo "▶ Running apply_hooks.py..."
         if ! python3 "$SCRIPT" "$KERNEL_DIR" 2>&1 | tee patch.log; then
-          echo "❌ PATCH SCRIPT GAGAL"
-          cat patch.log
-          exit 1
+          echo "❌ PATCH SCRIPT GAGAL"; cat patch.log; exit 1
         fi
 
         echo ""
@@ -256,26 +306,21 @@ jobs:
         )
         FAILED=0
         for entry in "${CRITICAL_FILES[@]}"; do
-          FILE="${entry%%:*}"
-          MARKER="${entry##*:}"
+          FILE="${entry%%:*}"; MARKER="${entry##*:}"
           if grep -q "$MARKER" "$KERNEL_DIR/$FILE" 2>/dev/null; then
             echo "  ✅ $FILE ($MARKER)"
           else
-            echo "  ❌ CRITICAL: $FILE tidak memiliki $MARKER"
-            FAILED=1
+            echo "  ❌ $FILE tidak memiliki $MARKER"; FAILED=1
           fi
         done
-        if [ $FAILED -eq 1 ]; then
-          echo "❌ Patch kritis gagal!"
-          exit 1
-        fi
+        [ $FAILED -eq 1 ] && { echo "❌ Patch kritis gagal!"; exit 1; }
         echo "✅ Semua patch kritis berhasil"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 5: Configure Kernel
+    # STEP 6: Configure Kernel
     # ══════════════════════════════════════════════════════════
 
-    - name: "U0001F3D7️ Configure kernel"
+    - name: 🏗️ Configure kernel
       run: |
         cd kernel
 
@@ -297,10 +342,7 @@ jobs:
         for cfg_path in \
           "arch/arm64/configs/vendor/timelm.config" \
           "arch/arm64/configs/timelm.config"; do
-          if [ -f "$cfg_path" ]; then
-            TIMELM_CFG="$cfg_path"
-            break
-          fi
+          if [ -f "$cfg_path" ]; then TIMELM_CFG="$cfg_path"; break; fi
         done
 
         if [ -n "$TIMELM_CFG" ]; then
@@ -326,11 +368,11 @@ jobs:
           --enable CONFIG_OVERLAY_FS \
           --enable CONFIG_KSU
 
-        # Cek nama config KSU_MANUAL_HOOK yang tepat dari Kconfig SukiSU
+        # Auto-detect nama CONFIG_KSU_MANUAL_HOOK yang tepat
         MANUAL_HOOK_CFG=$(grep -o 'config KSU_MANUAL_HOOK\|config KSU_MANUAL\b' \
           drivers/kernelsu/Kconfig 2>/dev/null | head -1 | awk '{print $2}')
         if [ -n "$MANUAL_HOOK_CFG" ]; then
-          echo "  Enabling $MANUAL_HOOK_CFG (non-kprobe fallback)..."
+          echo "  Enabling CONFIG_${MANUAL_HOOK_CFG} (non-kprobe fallback)..."
           ./scripts/config --file out/.config --enable "CONFIG_${MANUAL_HOOK_CFG}"
         fi
 
@@ -348,12 +390,10 @@ jobs:
           echo "  ✅ CONFIG_KSU=${KSU_VAL}"
         else
           echo "  ❌ CONFIG_KSU tidak aktif! Nilai: '${KSU_VAL}'"
-          echo "  Dependency check:"
-          grep '^CONFIG_KPROBES='  out/.config || echo "    CONFIG_KPROBES not set"
-          grep '^CONFIG_EXT4_FS='  out/.config || echo "    CONFIG_EXT4_FS not set"
+          grep '^CONFIG_KPROBES=' out/.config  || echo "    CONFIG_KPROBES not set"
+          grep '^CONFIG_EXT4_FS=' out/.config  || echo "    CONFIG_EXT4_FS not set"
           grep '^CONFIG_MODULES='  out/.config || echo "    CONFIG_MODULES not set"
-          echo "  KSU Kconfig:"
-          grep -A8 'config KSU' drivers/kernelsu/Kconfig || echo "  TIDAK ADA!"
+          grep -A8 'config KSU' drivers/kernelsu/Kconfig || echo "    KSU Kconfig tidak ditemukan"
           exit 1
         fi
         grep '^CONFIG_MODULES='    out/.config || echo "  CONFIG_MODULES not set"
@@ -361,27 +401,18 @@ jobs:
         grep '^CONFIG_OVERLAY_FS=' out/.config || echo "  CONFIG_OVERLAY_FS not set"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 5b: Pre-build KSU isolation test
-    #
-    # FIX #3: Tambah V=1 (verbose) agar error kompilasi C tampil
-    #   lengkap di log, bukan hanya summary "Error 2".
-    # FIX #5: Print full log ke stdout bahkan saat sukses (summary).
+    # STEP 7: Pre-build KSU Isolation Test
     # ══════════════════════════════════════════════════════════
 
-    - name: "U0001F9EA Pre-build KSU module isolation test"
+    - name: 🧪 Pre-build KSU module isolation test
       run: |
         cd kernel
 
         echo "════════════════════════════════════════"
-        echo "  KSU Module Isolation Test (FIX #3: V=1 verbose)"
-        echo "  Target: drivers/kernelsu/ only"
+        echo "  KSU Isolation Test — V=1 verbose"
+        echo "  (FIX #3 dari v3: verbose untuk expose error)"
         echo "════════════════════════════════════════"
-        echo ""
 
-        # FIX #3: Tambah V=1 untuk verbose compiler output.
-        # Tanpa V=1, make hanya print "CC drivers/kernelsu/xxx.o"
-        # dan tidak menampilkan error clang yang sebenarnya.
-        # Dengan V=1, full clang command + error message akan tampil.
         set -o pipefail
         make O=out ARCH=arm64 \
           CC=clang \
@@ -394,39 +425,36 @@ jobs:
 
         KSU_TEST_EXIT=${PIPESTATUS[0]}
 
-        # FIX #5: Always print key info dari log
+        # Selalu print summary (warnings & errors)
         echo ""
-        echo "▶ Build log summary (warnings & errors):"
-        echo "────────────────────────────────────────────"
-        grep -E 'warning:|error:|note:|undefined|cannot find|No such' \
+        echo "▶ Build log summary:"
+        echo "────────────────────────────────────────"
+        grep -E 'warning:|error:|fatal error:|undefined|cannot find|No such' \
           ksu_build_test.log | head -30 || echo "  (tidak ada warning/error)"
-        echo "────────────────────────────────────────────"
+        echo "────────────────────────────────────────"
 
         if [ $KSU_TEST_EXIT -ne 0 ]; then
           echo ""
-          echo "❌ KSU MODULE BUILD FAILED"
-          echo "   Root cause terisolasi di step ini!"
+          echo "❌ KSU MODULE BUILD FAILED — root cause:"
           echo ""
-          echo "▶ LAST 60 LINES of ksu_build_test.log:"
+          echo "▶ LAST 80 LINES:"
           echo "════════════════════════════════════════"
-          tail -60 ksu_build_test.log
+          tail -80 ksu_build_test.log
           echo "════════════════════════════════════════"
           echo ""
           echo "▶ ALL ERROR LINES:"
-          grep -n -E 'error:|undefined reference|cannot find|No such file|fatal error' \
+          grep -n -E 'error:|fatal error:|undefined reference|cannot find|No such file' \
             ksu_build_test.log || echo "  (tidak ada pattern error standar)"
           exit 1
         fi
 
-        echo ""
-        echo "✅ KSU isolation test PASSED!"
-        echo "   Lanjut ke full kernel build..."
+        echo "✅ KSU isolation test PASSED — lanjut full build"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 6: Build Kernel (Full)
+    # STEP 8: Compile Kernel (Full)
     # ══════════════════════════════════════════════════════════
 
-    - name: "U0001F528 Compile kernel"
+    - name: 🔨 Compile kernel
       run: |
         cd kernel
 
@@ -438,7 +466,6 @@ jobs:
         echo "Cores    : $(nproc)"
         echo "Disk free: $(df -h / | tail -1 | awk '{print $4}')"
         echo "Time     : $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "════════════════════════════════════════"
 
         set -o pipefail
         timeout 90m make O=out ARCH=arm64 \
@@ -450,48 +477,35 @@ jobs:
           2>&1 | tee build.log
 
         BUILD_EXIT=${PIPESTATUS[0]}
-
-        BUILD_END=$(date +%s)
-        BUILD_TIME=$(( BUILD_END - BUILD_START ))
+        BUILD_TIME=$(( $(date +%s) - BUILD_START ))
 
         echo ""
         echo "════════════════════════════════════════"
         echo "Exit code: $BUILD_EXIT"
         echo "Duration : $(printf '%02d:%02d:%02d' $((BUILD_TIME/3600)) $((BUILD_TIME%3600/60)) $((BUILD_TIME%60)))"
         echo "Disk free: $(df -h / | tail -1 | awk '{print $4}')"
-        echo "════════════════════════════════════════"
 
         if [ "$BUILD_EXIT" -ne 0 ]; then
           echo "❌ COMPILATION FAILED"
-          echo ""
 
-          AVAIL_KB=$(df / | tail -1 | awk '{print $4}')
-          AVAIL_MB=$(( AVAIL_KB / 1024 ))
-          [ "$AVAIL_MB" -lt 500 ] && echo "U0001F6A8 DISK KRITIS: ${AVAIL_MB}MB tersisa"
+          AVAIL_MB=$(( $(df / | tail -1 | awk '{print $4}') / 1024 ))
+          [ "$AVAIL_MB" -lt 500 ] && echo "🚨 DISK KRITIS: ${AVAIL_MB}MB"
 
           if [ -f build.log ] && [ -s build.log ]; then
             echo ""
-            echo "▶ [A] LAST 80 LINES (linker errors biasanya di sini):"
-            echo "══════════════════════════════════════════════════"
+            echo "▶ [A] LAST 80 LINES:"
             tail -80 build.log
             echo ""
-
             echo "▶ [B] FIRST ERROR + context:"
-            echo "══════════════════════════════════════════════════"
             ERRLINE=$(grep -n \
               -E '^[^:]+\.(c|h|S):[0-9]+:[0-9]+: error:|make\[[0-9]+\]: \*\*\*|No space left|ld\.lld: error:|undefined reference' \
               build.log | head -1 | cut -d: -f1)
             if [ -n "$ERRLINE" ]; then
-              echo "  → First error at build.log line $ERRLINE"
               START=$(( ERRLINE > 20 ? ERRLINE - 20 : 1 ))
               sed -n "${START},$(( ERRLINE + 40 ))p" build.log
-            else
-              echo "  (tidak ada pola error standar)"
             fi
-
             echo ""
-            echo "▶ [C] ALL ERROR LINES:"
-            echo "══════════════════════════════════════════════════"
+            echo "▶ [C] ALL ERRORS:"
             grep -n -E 'error:|undefined reference|No space left' build.log | head -50 \
               || echo "  (tidak ada)"
           else
@@ -501,46 +515,43 @@ jobs:
         fi
 
         echo "▶ Build artifacts:"
-        IMAGES_FOUND=0
+        FOUND=0
         for img in Image.gz-dtb Image.gz Image; do
           if [ -f "out/arch/arm64/boot/$img" ]; then
-            SIZE=$(du -h "out/arch/arm64/boot/$img" | cut -f1)
-            echo "  ✅ $img ($SIZE)"
-            IMAGES_FOUND=1
+            echo "  ✅ $img ($(du -h out/arch/arm64/boot/$img | cut -f1))"
+            FOUND=1
           fi
         done
-        [ "$IMAGES_FOUND" -eq 0 ] && { echo "❌ Tidak ada kernel image!"; ls -la out/arch/arm64/boot/ || true; exit 1; }
-
-        echo ""
+        [ "$FOUND" -eq 0 ] && { echo "❌ Tidak ada kernel image!"; exit 1; }
         echo "✅ BUILD SUCCESS (SukiSU Ultra)"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 7: Create Flashable ZIP
+    # STEP 9: Create Flashable ZIP
     # ══════════════════════════════════════════════════════════
 
-    - name: "U0001F4E6 Create AnyKernel3 flashable ZIP"
+    - name: 📦 Create AnyKernel3 flashable ZIP
       run: |
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
         cd AnyKernel3
 
-        sed -i 's|do\.devicecheck=.*|do.devicecheck=1|' anykernel.sh
-        sed -i 's|device\.name1=.*|device.name1=timelm|' anykernel.sh
-        sed -i 's|device\.name2=.*|device.name2=lge_v60|' anykernel.sh
-        sed -i 's|device\.name3=.*|device.name3=LM-V600|' anykernel.sh
-        sed -i 's|device\.name4=.*|device.name4=LM-V600N|' anykernel.sh
-        sed -i 's|device\.name5=.*|device.name5=|' anykernel.sh
-        sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
-        sed -i 's|is_slot_device=.*|is_slot_device=1;|' anykernel.sh
+        sed -i 's|do\.devicecheck=.*|do.devicecheck=1|'                    anykernel.sh
+        sed -i 's|device\.name1=.*|device.name1=timelm|'                  anykernel.sh
+        sed -i 's|device\.name2=.*|device.name2=lge_v60|'                 anykernel.sh
+        sed -i 's|device\.name3=.*|device.name3=LM-V600|'                 anykernel.sh
+        sed -i 's|device\.name4=.*|device.name4=LM-V600N|'                anykernel.sh
+        sed -i 's|device\.name5=.*|device.name5=|'                        anykernel.sh
+        sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|'     anykernel.sh
+        sed -i 's|is_slot_device=.*|is_slot_device=1;|'                    anykernel.sh
 
         BRANCH="${{ github.event.inputs.kernel_branch }}"
-        sed -i "s|kernel\.string=.*|kernel.string=SukiSU Ultra for LG V60 ThinQ (${BRANCH})|" anykernel.sh
+        sed -i "s|kernel\.string=.*|kernel.string=SukiSU Ultra LG V60 (${BRANCH})|" anykernel.sh
 
         BOOT="../kernel/out/arch/arm64/boot"
         COPIED=0
         for img in Image.gz-dtb Image.gz Image; do
           if [ -f "$BOOT/$img" ]; then
             cp "$BOOT/$img" ./
-            echo "✅ $img copied ($(du -h $img | cut -f1))"
+            echo "✅ $img ($(du -h $img | cut -f1))"
             COPIED=1; break
           fi
         done
@@ -549,20 +560,23 @@ jobs:
         mkdir -p dtbs
         if [ -d "$BOOT/dts" ]; then
           DTB_COUNT=$(find "$BOOT/dts" -name "*.dtb" | wc -l)
-          [ "$DTB_COUNT" -gt 0 ] && find "$BOOT/dts" -name "*.dtb" -exec cp {} dtbs/ \; && echo "✅ $DTB_COUNT DTB files copied"
+          [ "$DTB_COUNT" -gt 0 ] && \
+            find "$BOOT/dts" -name "*.dtb" -exec cp {} dtbs/ \; && \
+            echo "✅ $DTB_COUNT DTB files"
         fi
 
         BUILD_DATE=$(date +%Y%m%d-%H%M)
         ZIP_NAME="SukiSU-Ultra-V60-${BRANCH}-${BUILD_DATE}.zip"
-        zip -r9 "../${ZIP_NAME}" . -x ".git/*" -x "README.md" -x "*.placeholder" -x ".gitignore"
+        zip -r9 "../${ZIP_NAME}" . \
+          -x ".git/*" -x "README.md" -x "*.placeholder" -x ".gitignore"
         cd ..
         echo "✅ ZIP: ${ZIP_NAME} ($(du -h ${ZIP_NAME} | cut -f1))"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 8: Upload Artifacts
+    # STEP 10: Upload Artifacts
     # ══════════════════════════════════════════════════════════
 
-    - name: "⬆️ Upload kernel ZIP"
+    - name: ⬆️ Upload kernel ZIP
       uses: actions/upload-artifact@v4
       with:
         name: SukiSU-Ultra-V60-Kernel-${{ github.event.inputs.kernel_branch }}
@@ -570,7 +584,7 @@ jobs:
         retention-days: 7
         compression-level: 0
 
-    - name: "⬆️ Upload build logs & config"
+    - name: ⬆️ Upload build logs & config
       if: always()
       uses: actions/upload-artifact@v4
       with:
@@ -583,40 +597,39 @@ jobs:
         retention-days: 7
 
     # ══════════════════════════════════════════════════════════
-    # STEP 9: Summary
+    # STEP 11: Summary
     # ══════════════════════════════════════════════════════════
 
-    - name: "U0001F4CA Build summary"
+    - name: 📊 Build summary
       if: always()
       run: |
-        echo ""
         echo "═══════════════════════════════════════════════════════"
-        echo "              BUILD SUMMARY — SukiSU Ultra"
+        echo "              BUILD SUMMARY — SukiSU Ultra v4"
         echo "═══════════════════════════════════════════════════════"
 
         if ls SukiSU-Ultra-V60-*.zip 1>/dev/null 2>&1; then
           echo "✅ Status: SUCCESS"
           ls -lh SukiSU-Ultra-V60-*.zip
           echo ""
-          echo "U0001F4E5 Download: Actions → Summary → Artifacts"
-          echo "U0001F4F1 Flash via TWRP/OrangeFox"
+          echo "📥 Download: Actions → Summary → Artifacts"
+          echo "📱 Flash via TWRP/OrangeFox"
           echo "⚠️  Backup boot.img dulu!"
           echo "⚠️  Gunakan SukiSU Ultra Manager (BUKAN KernelSU Manager)"
         else
           echo "❌ Status: FAILED"
           echo ""
-          echo "U0001F4CB Troubleshooting (urutan prioritas):"
-          echo "  1. Cek log step 'Pre-build KSU module isolation test'"
-          echo "     → Error di sini = masalah di SukiSU source"
-          echo "  2. Cek log step 'Compile kernel' bagian [A][B][C]"
+          echo "📋 Troubleshooting:"
+          echo "  1. Cek step 'Pre-build KSU module isolation test'"
+          echo "  2. Cek step 'Compile kernel' bagian [A][B][C]"
           echo "  3. Download artifact 'build-logs'"
           echo ""
-          echo "U0001F527 Fixes yang sudah diterapkan di v3:"
-          echo "  - obj-$(CONFIG_KSU) bukan obj-y (FIX #1)"
-          echo "  - cp -r bukan symlink (FIX #2)"
-          echo "  - V=1 verbose build di isolation test (FIX #3)"
-          echo "  - Auto-detect struktur SukiSU repo (FIX #4)"
-          echo "  - Full log print sebelum exit (FIX #5)"
+          echo "🔧 Fixes di v4:"
+          echo "  - ccflags-y += -I$(srctree)/drivers/kernelsu [FIX UTAMA v4]"
+          echo "    → Fix fatal error: uapi/feature.h / uapi/app_profile.h not found"
+          echo "  - obj-$(CONFIG_KSU) bukan obj-y [v3]"
+          echo "  - cp -r bukan symlink [v3]"
+          echo "  - V=1 verbose isolation test [v3]"
+          echo "  - Auto-detect SukiSU struktur [v3]"
         fi
 
         echo ""
