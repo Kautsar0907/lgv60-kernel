@@ -1,31 +1,21 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════
-  SuKiSu Ultra Manual Hook Patcher
+  SukiSU Ultra Manual Hook Patcher
   Untuk: LG V60 ThinQ (timelm) — Linux kernel 4.19 non-GKI
-═══════════════════════════════════════════════════════════════
-  Script ini menambahkan "hook" ke beberapa file kernel agar
-  SuKiSu Ultra / KernelSU bisa berjalan di kernel non-GKI.
-
-  File yang di-patch:
-    1. fs/exec.c              ← deteksi eksekusi program
-    2. fs/open.c              ← intercept file access check
-    3. fs/read_write.c        ← intercept baca file
-    4. fs/stat.c              ← intercept stat file
-    5. drivers/input/input.c  ← safe mode (penting!)
-    6. fs/devpts/inode.c      ← perbaikan terminal
-    7. fs/namespace.c         ← backport path_umount
 ═══════════════════════════════════════════════════════════════
 """
 
 import os
 import sys
+import shutil
 
-# Ambil path kernel dari argumen, default "." (folder sekarang)
+# Ambil path kernel dari argumen
 KERNEL_DIR = sys.argv[1] if len(sys.argv) > 1 else "."
 
-# Counter hasil
+# Counter & tracking
 hasil = {"berhasil": 0, "sudah_ada": 0, "gagal": 0}
+failed_files = []
 
 # ─────────────────────────────────────────────────────────────
 # Helper functions
@@ -38,20 +28,39 @@ def path(relative):
 def baca(file_rel):
     """Baca file, return None jika tidak ada."""
     p = path(file_rel)
-    if not os.path.exists(p):
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except FileNotFoundError:
         log_gagal(f"{file_rel}: FILE TIDAK DITEMUKAN")
+        failed_files.append(file_rel)
         return None
-    with open(p, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
+    except Exception as e:
+        log_gagal(f"{file_rel}: Error membaca: {e}")
+        failed_files.append(file_rel)
+        return None
 
 def tulis(file_rel, konten):
-    """Tulis konten ke file."""
-    with open(path(file_rel), "w", encoding="utf-8") as f:
-        f.write(konten)
+    """Tulis konten ke file dengan backup."""
+    p = path(file_rel)
+    
+    # Backup file asli
+    if os.path.exists(p):
+        backup = p + ".bak"
+        shutil.copy2(p, backup)
+    
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(konten)
+    except Exception as e:
+        # Restore backup jika gagal
+        if os.path.exists(p + ".bak"):
+            shutil.move(p + ".bak", p)
+        raise e
 
-def sudah_dipatch(konten):
-    """Cek apakah file sudah pernah di-patch sebelumnya."""
-    return konten is not None and "CONFIG_KSU" in konten
+def sudah_dipatch(konten, marker):
+    """Cek marker unik (lebih spesifik dari global CONFIG_KSU)."""
+    return konten is not None and marker in konten
 
 def log_ok(msg):
     hasil["berhasil"] += 1
@@ -59,7 +68,7 @@ def log_ok(msg):
 
 def log_skip(msg):
     hasil["sudah_ada"] += 1
-    print(f"  ⏭️  {msg} (sudah di-patch sebelumnya, skip)")
+    print(f"  ⏭️  {msg}")
 
 def log_gagal(msg):
     hasil["gagal"] += 1
@@ -68,18 +77,19 @@ def log_gagal(msg):
 def log_info(msg):
     print(f"  ℹ️  {msg}")
 
-
 # ─────────────────────────────────────────────────────────────
 # PATCH 1: fs/exec.c
-# Tujuan: Intercept saat program dijalankan (execve)
 # ─────────────────────────────────────────────────────────────
 def patch_exec_c():
     FILE = "fs/exec.c"
     c = baca(FILE)
     if c is None: return
-    if sudah_dipatch(c): log_skip(FILE); return
+    
+    # Cek dengan marker unik
+    if sudah_dipatch(c, "ksu_execveat_hook"):
+        log_skip(FILE)
+        return
 
-    # Deklarasi fungsi eksternal yang akan kita panggil
     DEKLARASI = (
         "\n"
         "#ifdef CONFIG_KSU\n"
@@ -91,7 +101,6 @@ def patch_exec_c():
         "#endif\n"
     )
 
-    # Kode hook yang akan dimasukkan
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tif (unlikely(ksu_execveat_hook))\n"
@@ -102,16 +111,14 @@ def patch_exec_c():
         "\t"
     )
 
-    # Cari fungsi target
     FUNGSI = "static int do_execveat_common("
     if FUNGSI not in c:
         log_gagal(f"{FILE}: fungsi do_execveat_common tidak ditemukan")
+        failed_files.append(FILE)
         return
 
-    # Tambahkan deklarasi sebelum definisi fungsi
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
-    # Cari titik insert hook (sebelum return __do_execve_file)
     berhasil = False
     for anchor in ["return __do_execve_file(", "\t__do_execve_file("]:
         if anchor in c:
@@ -120,22 +127,24 @@ def patch_exec_c():
             break
 
     if not berhasil:
-        log_gagal(f"{FILE}: titik insert (__do_execve_file) tidak ditemukan")
+        log_gagal(f"{FILE}: titik insert tidak ditemukan")
+        failed_files.append(FILE)
         return
 
     tulis(FILE, c)
     log_ok(FILE)
 
-
 # ─────────────────────────────────────────────────────────────
 # PATCH 2: fs/open.c
-# Tujuan: Intercept pengecekan akses file (faccessat)
 # ─────────────────────────────────────────────────────────────
 def patch_open_c():
     FILE = "fs/open.c"
     c = baca(FILE)
     if c is None: return
-    if sudah_dipatch(c): log_skip(FILE); return
+    
+    if sudah_dipatch(c, "ksu_handle_faccessat"):
+        log_skip(FILE)
+        return
 
     DEKLARASI = (
         "\n"
@@ -144,6 +153,7 @@ def patch_open_c():
         "                               int *mode, int *flags);\n"
         "#endif\n"
     )
+    
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
@@ -151,7 +161,6 @@ def patch_open_c():
         "\t"
     )
 
-    # Coba do_faccessat (kernel >= 4.17) atau SYSCALL langsung
     FUNGSI_TARGET = None
     for fn in ["long do_faccessat(", "SYSCALL_DEFINE3(faccessat,"]:
         if fn in c:
@@ -160,38 +169,32 @@ def patch_open_c():
 
     if FUNGSI_TARGET is None:
         log_gagal(f"{FILE}: fungsi faccessat tidak ditemukan")
+        failed_files.append(FILE)
         return
 
     c = c.replace(FUNGSI_TARGET, DEKLARASI + FUNGSI_TARGET, 1)
 
-    # Titik insert: sebelum "if (mode & ~S_IRWXO)"
-    ANCHOR = "\tif (mode & ~S_IRWXO)"
-    if ANCHOR in c:
-        c = c.replace(ANCHOR, "\t" + HOOK.rstrip() + "\n" + ANCHOR, 1)
-        tulis(FILE, c)
-        log_ok(FILE)
-        return
-
-    # Fallback: setelah "unsigned int lookup_flags"
-    ANCHOR2 = "\tunsigned int lookup_flags = LOOKUP_FOLLOW;"
-    if ANCHOR2 in c:
-        c = c.replace(ANCHOR2, ANCHOR2 + "\n\t" + HOOK.rstrip(), 1)
-        tulis(FILE, c)
-        log_ok(FILE)
-        return
+    for anchor in ["\tif (mode & ~S_IRWXO)", "\tunsigned int lookup_flags = LOOKUP_FOLLOW;"]:
+        if anchor in c:
+            c = c.replace(anchor, "\t" + HOOK.rstrip() + "\n" + anchor, 1)
+            tulis(FILE, c)
+            log_ok(FILE)
+            return
 
     log_gagal(f"{FILE}: titik insert tidak ditemukan")
-
+    failed_files.append(FILE)
 
 # ─────────────────────────────────────────────────────────────
 # PATCH 3: fs/read_write.c
-# Tujuan: Intercept operasi baca file (vfs_read)
 # ─────────────────────────────────────────────────────────────
 def patch_read_write_c():
     FILE = "fs/read_write.c"
     c = baca(FILE)
     if c is None: return
-    if sudah_dipatch(c): log_skip(FILE); return
+    
+    if sudah_dipatch(c, "ksu_vfs_read_hook"):
+        log_skip(FILE)
+        return
 
     DEKLARASI = (
         "\n"
@@ -201,6 +204,7 @@ def patch_read_write_c():
         "                               size_t *count_ptr, loff_t **pos);\n"
         "#endif\n"
     )
+    
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tif (unlikely(ksu_vfs_read_hook))\n"
@@ -212,11 +216,11 @@ def patch_read_write_c():
     FUNGSI = "ssize_t vfs_read("
     if FUNGSI not in c:
         log_gagal(f"{FILE}: fungsi vfs_read tidak ditemukan")
+        failed_files.append(FILE)
         return
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
-    # Titik insert: sebelum pengecekan pertama di dalam fungsi
     ANCHOR = "\tif (!(file->f_mode & FMODE_READ))"
     if ANCHOR in c:
         c = c.replace(ANCHOR, "\t" + HOOK.rstrip() + "\n" + ANCHOR, 1)
@@ -225,17 +229,19 @@ def patch_read_write_c():
         return
 
     log_gagal(f"{FILE}: titik insert tidak ditemukan")
-
+    failed_files.append(FILE)
 
 # ─────────────────────────────────────────────────────────────
 # PATCH 4: fs/stat.c
-# Tujuan: Intercept pengecekan info file (stat)
 # ─────────────────────────────────────────────────────────────
 def patch_stat_c():
     FILE = "fs/stat.c"
     c = baca(FILE)
     if c is None: return
-    if sudah_dipatch(c): log_skip(FILE); return
+    
+    if sudah_dipatch(c, "ksu_handle_stat"):
+        log_skip(FILE)
+        return
 
     DEKLARASI = (
         "\n"
@@ -245,8 +251,6 @@ def patch_stat_c():
         "#endif\n"
     )
 
-    # vfs_statx menggunakan 'flags', vfs_fstatat menggunakan 'flag'
-    # Coba keduanya
     for fungsi, var_flags in [
         ("int vfs_statx(", "&flags"),
         ("int vfs_fstatat(", "&flag"),
@@ -263,11 +267,7 @@ def patch_stat_c():
 
         c = c.replace(fungsi, DEKLARASI + fungsi, 1)
 
-        # Titik insert: setelah pengecekan flag awal
-        for anchor in [
-            "\tint error = -EINVAL;\n",
-            "\tunsigned int lookup_flags",
-        ]:
+        for anchor in ["\tint error = -EINVAL;\n", "\tunsigned int lookup_flags"]:
             if anchor in c:
                 c = c.replace(anchor, anchor + "\t" + HOOK.rstrip() + "\n", 1)
                 tulis(FILE, c)
@@ -275,18 +275,19 @@ def patch_stat_c():
                 return
 
     log_gagal(f"{FILE}: fungsi vfs_statx/vfs_fstatat tidak ditemukan")
-
+    failed_files.append(FILE)
 
 # ─────────────────────────────────────────────────────────────
-# PATCH 5: drivers/input/input.c
-# Tujuan: Safe mode — tekan kombinasi tombol untuk nonaktifkan root
-#         PENTING: tanpa ini, jika root bermasalah, HP bisa bootloop
+# PATCH 5: drivers/input/input.c (CRITICAL!)
 # ─────────────────────────────────────────────────────────────
 def patch_input_c():
     FILE = "drivers/input/input.c"
     c = baca(FILE)
     if c is None: return
-    if sudah_dipatch(c): log_skip(FILE); return
+    
+    if sudah_dipatch(c, "ksu_input_hook"):
+        log_skip(FILE)
+        return
 
     DEKLARASI = (
         "\n"
@@ -296,6 +297,7 @@ def patch_input_c():
         "                                          unsigned int *code, int *value);\n"
         "#endif\n"
     )
+    
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tif (unlikely(ksu_input_hook))\n"
@@ -307,33 +309,32 @@ def patch_input_c():
     FUNGSI = "static void input_handle_event("
     if FUNGSI not in c:
         log_gagal(f"{FILE}: fungsi input_handle_event tidak ditemukan")
+        failed_files.append(FILE)
         return
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
-    # Titik insert: setelah baris disposition, sebelum if pertama
-    for anchor in [
-        "\tif (disposition != INPUT_IGNORE_EVENT",
-        "\tswitch (disposition)",
-    ]:
+    for anchor in ["\tif (disposition != INPUT_IGNORE_EVENT", "\tswitch (disposition)"]:
         if anchor in c:
             c = c.replace(anchor, "\t" + HOOK.rstrip() + "\n" + anchor, 1)
             tulis(FILE, c)
             log_ok(FILE)
             return
 
-    log_gagal(f"{FILE}: titik insert (disposition) tidak ditemukan")
-
+    log_gagal(f"{FILE}: titik insert tidak ditemukan")
+    failed_files.append(FILE)
 
 # ─────────────────────────────────────────────────────────────
 # PATCH 6: fs/devpts/inode.c
-# Tujuan: Perbaikan agar terminal (shell) bisa berjalan normal
 # ─────────────────────────────────────────────────────────────
 def patch_devpts_c():
     FILE = "fs/devpts/inode.c"
     c = baca(FILE)
     if c is None: return
-    if sudah_dipatch(c): log_skip(FILE); return
+    
+    if sudah_dipatch(c, "ksu_handle_devpts"):
+        log_skip(FILE)
+        return
 
     DEKLARASI = (
         "\n"
@@ -341,6 +342,7 @@ def patch_devpts_c():
         "extern int ksu_handle_devpts(struct inode*);\n"
         "#endif\n"
     )
+    
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_devpts(dentry->d_inode);\n"
@@ -351,6 +353,7 @@ def patch_devpts_c():
     FUNGSI = "void *devpts_get_priv("
     if FUNGSI not in c:
         log_gagal(f"{FILE}: fungsi devpts_get_priv tidak ditemukan")
+        failed_files.append(FILE)
         return
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
@@ -363,24 +366,20 @@ def patch_devpts_c():
         return
 
     log_gagal(f"{FILE}: titik insert tidak ditemukan")
-
+    failed_files.append(FILE)
 
 # ─────────────────────────────────────────────────────────────
-# PATCH 7: fs/namespace.c
-# Tujuan: Backport fungsi path_umount (dibutuhkan oleh modul KSU)
-#         Fungsi ini ada di kernel baru tapi tidak ada di 4.19
+# PATCH 7: fs/namespace.c (Optional backport)
 # ─────────────────────────────────────────────────────────────
 def patch_namespace_c():
     FILE = "fs/namespace.c"
     c = baca(FILE)
     if c is None: return
 
-    # Cek apakah path_umount sudah ada (mungkin sudah di-backport)
     if "int path_umount(" in c:
         log_skip(f"{FILE} (path_umount sudah ada)")
         return
 
-    # Kode fungsi path_umount yang akan ditambahkan
     PATH_UMOUNT_CODE = """
 /* KernelSU: backport path_umount dari kernel yang lebih baru */
 static int can_umount(const struct path *path, int flags)
@@ -418,7 +417,6 @@ int path_umount(struct path *path, int flags)
 
 """
 
-    # Masukkan sebelum ksys_umount atau SYSCALL umount
     for anchor in ["static int ksys_umount(", "SYSCALL_DEFINE2(umount,"]:
         if anchor in c:
             c = c.replace(anchor, PATH_UMOUNT_CODE + anchor, 1)
@@ -426,23 +424,18 @@ int path_umount(struct path *path, int flags)
             log_ok(f"{FILE} (backport path_umount)")
             return
 
-    # Jika anchor tidak ditemukan, ini warning saja (tidak fatal)
-    log_info(f"{FILE}: ksys_umount tidak ditemukan, path_umount di-skip")
-    hasil["berhasil"] -= 1  # jangan hitung sebagai berhasil
-
+    log_info(f"{FILE}: ksys_umount tidak ditemukan, path_umount tidak di-backport (optional)")
 
 # ─────────────────────────────────────────────────────────────
-# MAIN: Jalankan semua patch
+# MAIN
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print()
-    print("═" * 55)
-    print("  SuKiSu Ultra — Manual Hook Patcher")
+    print("═" * 60)
+    print("  SukiSU Ultra — Manual Hook Patcher")
     print(f"  Kernel dir: {os.path.abspath(KERNEL_DIR)}")
-    print("═" * 55)
+    print("═" * 60)
     print()
-
-    print("Memulai patch...\n")
 
     patch_exec_c()
     patch_open_c()
@@ -453,22 +446,30 @@ if __name__ == "__main__":
     patch_namespace_c()
 
     print()
-    print("═" * 55)
-    print(f"  Hasil: ✅ {hasil['berhasil']} berhasil  |  "
-          f"⏭️  {hasil['sudah_ada']} di-skip  |  "
-          f"❌ {hasil['gagal']} gagal")
-    print("═" * 55)
+    print("═" * 60)
+    print(f"  Hasil: ✅ {hasil['berhasil']}  |  ⏭️ {hasil['sudah_ada']}  |  ❌ {hasil['gagal']}")
+    print("═" * 60)
     print()
 
+    CRITICAL_FILES = ["fs/exec.c", "fs/open.c", "drivers/input/input.c"]
+    
     if hasil["gagal"] > 0:
-        print("⚠️  PERINGATAN: Ada patch yang gagal!")
-        print("   Kemungkinan struktur kode sumber berbeda dari yang diharapkan.")
-        print("   Build mungkin tetap berhasil jika file yang gagal tidak kritis,")
-        print("   tapi SuKiSu mungkin tidak berfungsi sempurna.")
-        print()
-        # Keluar dengan error agar GitHub Actions menampilkan status FAIL
-        sys.exit(1)
+        print("⚠️  Ada patch yang gagal:")
+        for f in failed_files:
+            is_critical = f in CRITICAL_FILES
+            marker = "🔴 CRITICAL" if is_critical else "⚠️  OPTIONAL"
+            print(f"   {marker}: {f}")
+        
+        # Exit 1 jika ada critical file yang gagal
+        critical_failed = any(f in CRITICAL_FILES for f in failed_files)
+        if critical_failed:
+            print()
+            print("❌ Critical patch gagal! Build akan error.")
+            sys.exit(1)
+        else:
+            print()
+            print("ℹ️  Hanya optional patch yang gagal, build mungkin tetap jalan.")
+            sys.exit(0)
     else:
-        print("✅ Semua patch berhasil! Melanjutkan ke proses build...")
-        print()
+        print("✅ Semua patch berhasil!")
         sys.exit(0)
