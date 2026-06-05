@@ -123,14 +123,9 @@ jobs:
         cd kernel
         ESOC_DEV_C="drivers/esoc/esoc_dev.c"
         if [ -f "$ESOC_DEV_C" ]; then
-          # Tambahkan definisi fungsi esoc_mdm_log di bagian atas file (setelah include)
-          # Cari baris #include lalu sisipkan definisi setelahnya
-          # Kita buat fungsi kosong (no-op) karena hanya untuk logging
-          sed -i '/^#include/a \
-\
-/* Added by workflow fix - define missing esoc_mdm_log */ \
-void esoc_mdm_log(const char *fmt, ...) { } \
-' "$ESOC_DEV_C"
+          # Sisipkan definisi fungsi setelah baris yang mengandung #include
+          # Gunakan echo dengan escaped newline
+          echo -e '\n/* Added by workflow fix - define missing esoc_mdm_log */\nvoid esoc_mdm_log(const char *fmt, ...) { }\n' >> "$ESOC_DEV_C"
           echo "✅ esoc_dev.c ditambahkan definisi esoc_mdm_log"
         fi
 
@@ -139,19 +134,16 @@ void esoc_mdm_log(const char *fmt, ...) { } \
         cd kernel
         CAM_OIS_C="techpack/camera/drivers/cam_sensor_module/cam_ois/cam_ois_core.c"
         if [ -f "$CAM_OIS_C" ]; then
-          # Tambahkan __maybe_unused ke variabel ois_userdata
           sed -i 's/struct ois_userdata \*ois_userdata/struct ois_userdata __maybe_unused *ois_userdata/' "$CAM_OIS_C"
           echo "✅ cam_ois_core.c diperbaiki"
         fi
 
-    - name: 🔧 Fix 4 - Disable -Werror globally (supaya warning tidak menggagalkan build)
+    - name: 🔧 Fix 4 - Disable -Werror globally
       run: |
         cd kernel
-        # Matikan -Werror di Makefile utama
         find . -name "Makefile" -type f -exec sed -i 's/-Werror /-Wno-error /g' {} \;
-        # Matikan juga di arch/arm64/Makefile
         sed -i 's/-Werror /-Wno-error /g' arch/arm64/Makefile 2>/dev/null || true
-        echo "✅ -Werror dinonaktifkan di semua Makefile"
+        echo "✅ -Werror dinonaktifkan"
 
     - name: 🏗️ Build kernel
       id: build
@@ -179,7 +171,6 @@ void esoc_mdm_log(const char *fmt, ...) { } \
           CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
           2>&1 | tee build.log
 
-        # Cek apakah kernel image tercipta
         if [ ! -f "out/arch/arm64/boot/Image" ] && [ ! -f "out/arch/arm64/boot/Image.gz" ] && [ ! -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
           echo "❌ Kernel image tidak ditemukan"
           exit 1
