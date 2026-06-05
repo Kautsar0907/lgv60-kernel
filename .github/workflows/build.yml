@@ -131,12 +131,10 @@ jobs:
           exit 1
         fi
 
-        # Tampilkan struktur untuk verifikasi
         echo "   .c files:"
         ls "${SUKISU_KERNEL_DIR}"/*.c 2>/dev/null | head -5 \
           || find "${SUKISU_KERNEL_DIR}" -name '*.c' | head -5
 
-        # ── Hardcopy (cp -r) — bukan symlink ──────────────────
         echo ""
         echo "▶ Copying SukiSU → drivers/kernelsu/ (hardcopy)..."
         cp -r "${SUKISU_KERNEL_DIR}" drivers/kernelsu
@@ -155,53 +153,48 @@ jobs:
     # ══════════════════════════════════════════════════════════
     # STEP 4: Integrate SukiSU into Build System
     #
-    # FIX #MAIN (v4): Inject ccflags-y ke Makefile SukiSU
-    #   ROOT CAUSE: #include "uapi/feature.h" di policy/feature.h
-    #   mencari file relatif terhadap drivers/kernelsu/policy/uapi/
-    #   tapi file sebenarnya ada di drivers/kernelsu/uapi/
-    #   FIX: Tambah -I$(srctree)/drivers/kernelsu ke ccflags-y
-    #   sehingga compiler tahu harus mencari dari drivers/kernelsu/
-    #   sebagai root, dan "uapi/feature.h" → kernelsu/uapi/feature.h ✅
+    # ROOT CAUSE FIX (v5):
+    #   Bug lama: grep -qF "$(srctree)/..." menggunakan double-quote
+    #   sehingga shell EXPAND $(srctree) sebagai subshell → string
+    #   kosong → kondisi check selalu FALSE → inject rusak.
     #
-    # FIX #1 (v3): obj-$(CONFIG_KSU) bukan obj-y
+    #   Fix: gunakan single-quote untuk literal string comparison,
+    #   sederhanakan logic, tambah mandatory verification.
     # ══════════════════════════════════════════════════════════
 
     - name: 🔧 Integrate SukiSU into build system
       run: |
         cd kernel
 
-        # ══════════════════════════════════════════════════════
-        # FIX #MAIN: Inject ccflags-y untuk fix uapi header path
-        # ══════════════════════════════════════════════════════
-        echo "▶ [FIX #MAIN] Patching ccflags-y di drivers/kernelsu/Makefile..."
-        echo "  Root cause: policy/feature.h dan policy/allowlist.h menggunakan"
-        echo "  #include "uapi/feature.h" yang dicari relatif terhadap policy/"
-        echo "  tapi file ada di kernelsu/uapi/ — perlu tambah include path root."
-        echo ""
-
         KERNELSU_MK="drivers/kernelsu/Makefile"
 
-        # Tampilkan Makefile asli SukiSU untuk verifikasi
+        # ─────────────────────────────────────────────────────────
+        # FIX UTAMA v5: Inject ccflags-y dengan benar
+        #
+        # ROOT CAUSE error sebelumnya:
+        #   grep -qF "$(srctree)/drivers/kernelsu" "$KERNELSU_MK"
+        #   ↑ Double-quote menyebabkan shell expand $(srctree)
+        #   sebagai subshell command. Hasilnya string kosong,
+        #   sehingga kondisi check SELALU false → inject duplikat
+        #   atau tidak jalan sama sekali.
+        #
+        # FIX: gunakan single-quote untuk grep literal string check
+        #      sehingga '$(srctree)' diperlakukan sebagai plain text.
+        # ─────────────────────────────────────────────────────────
+        echo "▶ [FIX v5] Patching ccflags-y di ${KERNELSU_MK}..."
+        echo ""
         echo "  Makefile SukiSU SEBELUM patch:"
         cat "$KERNELSU_MK"
         echo "  ─────────────────────────────"
+        echo ""
 
-        # Cek apakah ccflags sudah ada dan sudah benar
-        CCFLAG_LINE='ccflags-y += -I$(srctree)/drivers/kernelsu'
-        if grep -qF 'ccflags-y' "$KERNELSU_MK"; then
-          if grep -qF "$(srctree)/drivers/kernelsu" "$KERNELSU_MK"; then
-            echo "  ✅ ccflags-y sudah ada dan sudah benar — skip inject"
-          else
-            # Ada ccflags tapi path berbeda — tambahkan path kita
-            echo "$CCFLAG_LINE" >> "$KERNELSU_MK"
-            echo "  ✅ ccflags-y ada tapi path berbeda — appended: $CCFLAG_LINE"
-          fi
+        # PENTING: single-quote di grep agar $(srctree) tidak di-expand shell
+        if ! grep -qF '$(srctree)/drivers/kernelsu' "$KERNELSU_MK"; then
+          # Inject di baris pertama — backslash-escape $ agar tidak di-expand
+          sed -i '1s|^|ccflags-y += -I$(srctree)/drivers/kernelsu\n|' "$KERNELSU_MK"
+          echo "  ✅ ccflags-y berhasil di-inject di baris 1"
         else
-          # Tidak ada ccflags sama sekali — inject di baris pertama
-          # Gunakan sed untuk insert di baris pertama agar tidak mengganggu
-          # existing Makefile structure (obj-y lines, subdir, dll)
-          sed -i "1s|^|$CCFLAG_LINE\n|" "$KERNELSU_MK"
-          echo "  ✅ Injected ccflags-y at line 1: $CCFLAG_LINE"
+          echo "  ✅ ccflags-y sudah ada dan benar — skip inject"
         fi
 
         echo ""
@@ -209,44 +202,74 @@ jobs:
         head -10 "$KERNELSU_MK"
         echo "  ─────────────────────────────"
 
-        # Verifikasi uapi directory ada
+        # Mandatory verification — gagalkan build jika inject tidak berhasil
         echo ""
-        echo "▶ Verifying uapi/ directory structure..."
+        echo "▶ Mandatory verification ccflags-y..."
+        if grep -qF '$(srctree)/drivers/kernelsu' "$KERNELSU_MK"; then
+          echo "  ✅ VERIFY OK: ccflags-y ada di Makefile"
+        else
+          echo "  ❌ VERIFY FAILED: ccflags-y TIDAK DITEMUKAN di Makefile!"
+          echo "     Isi Makefile saat ini:"
+          cat "$KERNELSU_MK"
+          exit 1
+        fi
+
+        # ─────────────────────────────────────────────────────────
+        # Verifikasi struktur uapi/ — critical header directory
+        # ─────────────────────────────────────────────────────────
+        echo ""
+        echo "▶ Verifying uapi/ header directory..."
         if [ -d "drivers/kernelsu/uapi" ]; then
           echo "  ✅ drivers/kernelsu/uapi/ EXISTS"
-          ls drivers/kernelsu/uapi/
-          # Cek file kritis
+          ls -la drivers/kernelsu/uapi/
           for hdr in "feature.h" "app_profile.h"; do
-            if [ -f "drivers/kernelsu/uapi/$hdr" ]; then
-              echo "  ✅ uapi/$hdr → OK"
+            if [ -f "drivers/kernelsu/uapi/${hdr}" ]; then
+              echo "  ✅ uapi/${hdr} → OK"
             else
-              echo "  ⚠️  uapi/$hdr → NOT FOUND (mungkin nama berbeda)"
+              echo "  ⚠️  uapi/${hdr} → NOT FOUND"
+              echo "     Mencari di seluruh kernelsu/..."
+              find drivers/kernelsu -name "${hdr}" | head -5
             fi
           done
         else
-          echo "  ⚠️  drivers/kernelsu/uapi/ TIDAK ADA"
-          echo "     Struktur aktual kernelsu/:"
-          find drivers/kernelsu -name '*.h' | head -20
-          echo ""
-          echo "  WARNING: ccflags-y sudah di-inject tapi jika uapi/ tidak ada,"
-          echo "  error yang sama akan tetap terjadi."
-          echo "  Cek apakah repo SukiSU menggunakan struktur header yang berbeda."
+          echo "  ⚠️  drivers/kernelsu/uapi/ TIDAK ADA!"
+          echo "     Mencari header kritis secara rekursif..."
+          find drivers/kernelsu -name 'feature.h' -o \
+                                -name 'app_profile.h' | head -10
+
+          # FALLBACK: Jika uapi/ tidak ada tapi header ada di lokasi lain,
+          # buat symlink uapi/ agar resolusi path tetap bekerja.
+          FEAT_H=$(find drivers/kernelsu -name 'feature.h' | \
+                   grep -v 'policy' | head -1)
+          if [ -n "$FEAT_H" ]; then
+            UAPI_ACTUAL_DIR=$(dirname "$FEAT_H")
+            echo "  🔧 Fallback: membuat symlink uapi/ → ${UAPI_ACTUAL_DIR}"
+            ln -sfn "$(realpath "$UAPI_ACTUAL_DIR")" \
+                    drivers/kernelsu/uapi
+            echo "  ✅ Symlink dibuat: drivers/kernelsu/uapi → ${UAPI_ACTUAL_DIR}"
+          else
+            echo "  ❌ feature.h tidak ditemukan sama sekali di repo SukiSU!"
+            echo "     Struktur repo:"
+            find drivers/kernelsu -name '*.h' | head -30
+            exit 1
+          fi
         fi
 
-        # ══════════════════════════════════════════════════════
-        # FIX #1 (v3): obj-$(CONFIG_KSU) bukan obj-y
-        # ══════════════════════════════════════════════════════
+        # ─────────────────────────────────────────────────────────
+        # FIX #1: obj-$(CONFIG_KSU) bukan obj-y
+        # ─────────────────────────────────────────────────────────
         echo ""
-        echo "▶ [FIX #1] Patching drivers/Makefile (obj-$(CONFIG_KSU))..."
+        echo "▶ [FIX #1] Patching drivers/Makefile..."
         if ! grep -q 'kernelsu' drivers/Makefile; then
           echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-          echo "  ✅ Added: obj-$(CONFIG_KSU) += kernelsu/"
+          echo "  ✅ Added: obj-\$(CONFIG_KSU) += kernelsu/"
         else
           if grep -q 'obj-y += kernelsu/' drivers/Makefile; then
-            sed -i 's|obj-y += kernelsu/|obj-$(CONFIG_KSU) += kernelsu/|g' drivers/Makefile
-            echo "  ✅ Fixed: obj-y → obj-$(CONFIG_KSU)"
+            sed -i 's|obj-y += kernelsu/|obj-$(CONFIG_KSU) += kernelsu/|g' \
+              drivers/Makefile
+            echo "  ✅ Fixed: obj-y → obj-\$(CONFIG_KSU)"
           else
-            echo "  ⏭️  kernelsu entry sudah ada di drivers/Makefile"
+            echo "  ⏭️  kernelsu entry sudah benar di drivers/Makefile"
             grep 'kernelsu' drivers/Makefile
           fi
         fi
@@ -265,7 +288,9 @@ jobs:
           echo "  ⏭️  kernelsu sudah ada di Kconfig"
         fi
 
+        # ─────────────────────────────────────────────────────────
         # Summary integrasi
+        # ─────────────────────────────────────────────────────────
         echo ""
         echo "════════ Integration Summary ════════"
         echo "drivers/Makefile:"
@@ -275,7 +300,8 @@ jobs:
         echo "drivers/kernelsu/Makefile (5 baris pertama):"
         head -5 drivers/kernelsu/Makefile
         echo "config KSU in Kconfig:"
-        grep -A 6 '^config KSU$' drivers/kernelsu/Kconfig || echo "  (tidak ditemukan)"
+        grep -A 6 '^config KSU$' drivers/kernelsu/Kconfig \
+          || echo "  (tidak ditemukan)"
         echo "═════════════════════════════════════"
 
     # ══════════════════════════════════════════════════════════
@@ -349,7 +375,8 @@ jobs:
           echo "  Using: $TIMELM_CFG"
           ./scripts/kconfig/merge_config.sh -O out out/.config "$TIMELM_CFG"
           MERGE_EXIT=$?
-          [ $MERGE_EXIT -ne 0 ] && echo "⚠️  merge_config.sh exit $MERGE_EXIT (non-fatal)"
+          [ $MERGE_EXIT -ne 0 ] && \
+            echo "⚠️  merge_config.sh exit $MERGE_EXIT (non-fatal)"
         else
           echo "  ⚠️  timelm.config tidak ditemukan, skip"
         fi
@@ -368,12 +395,12 @@ jobs:
           --enable CONFIG_OVERLAY_FS \
           --enable CONFIG_KSU
 
-        # Auto-detect nama CONFIG_KSU_MANUAL_HOOK yang tepat
         MANUAL_HOOK_CFG=$(grep -o 'config KSU_MANUAL_HOOK\|config KSU_MANUAL\b' \
           drivers/kernelsu/Kconfig 2>/dev/null | head -1 | awk '{print $2}')
         if [ -n "$MANUAL_HOOK_CFG" ]; then
-          echo "  Enabling CONFIG_${MANUAL_HOOK_CFG} (non-kprobe fallback)..."
-          ./scripts/config --file out/.config --enable "CONFIG_${MANUAL_HOOK_CFG}"
+          echo "  Enabling CONFIG_${MANUAL_HOOK_CFG}..."
+          ./scripts/config --file out/.config \
+            --enable "CONFIG_${MANUAL_HOOK_CFG}"
         fi
 
         make O=out ARCH=arm64 \
@@ -393,7 +420,8 @@ jobs:
           grep '^CONFIG_KPROBES=' out/.config  || echo "    CONFIG_KPROBES not set"
           grep '^CONFIG_EXT4_FS=' out/.config  || echo "    CONFIG_EXT4_FS not set"
           grep '^CONFIG_MODULES='  out/.config || echo "    CONFIG_MODULES not set"
-          grep -A8 'config KSU' drivers/kernelsu/Kconfig || echo "    KSU Kconfig tidak ditemukan"
+          grep -A8 'config KSU' drivers/kernelsu/Kconfig \
+            || echo "    KSU Kconfig tidak ditemukan"
           exit 1
         fi
         grep '^CONFIG_MODULES='    out/.config || echo "  CONFIG_MODULES not set"
@@ -410,7 +438,6 @@ jobs:
 
         echo "════════════════════════════════════════"
         echo "  KSU Isolation Test — V=1 verbose"
-        echo "  (FIX #3 dari v3: verbose untuk expose error)"
         echo "════════════════════════════════════════"
 
         set -o pipefail
@@ -425,7 +452,6 @@ jobs:
 
         KSU_TEST_EXIT=${PIPESTATUS[0]}
 
-        # Selalu print summary (warnings & errors)
         echo ""
         echo "▶ Build log summary:"
         echo "────────────────────────────────────────"
@@ -435,7 +461,7 @@ jobs:
 
         if [ $KSU_TEST_EXIT -ne 0 ]; then
           echo ""
-          echo "❌ KSU MODULE BUILD FAILED — root cause:"
+          echo "❌ KSU MODULE BUILD FAILED:"
           echo ""
           echo "▶ LAST 80 LINES:"
           echo "════════════════════════════════════════"
@@ -482,12 +508,14 @@ jobs:
         echo ""
         echo "════════════════════════════════════════"
         echo "Exit code: $BUILD_EXIT"
-        echo "Duration : $(printf '%02d:%02d:%02d' $((BUILD_TIME/3600)) $((BUILD_TIME%3600/60)) $((BUILD_TIME%60)))"
+        echo "Duration : $(printf '%02d:%02d:%02d' \
+          $((BUILD_TIME/3600)) \
+          $((BUILD_TIME%3600/60)) \
+          $((BUILD_TIME%60)))"
         echo "Disk free: $(df -h / | tail -1 | awk '{print $4}')"
 
         if [ "$BUILD_EXIT" -ne 0 ]; then
           echo "❌ COMPILATION FAILED"
-
           AVAIL_MB=$(( $(df / | tail -1 | awk '{print $4}') / 1024 ))
           [ "$AVAIL_MB" -lt 500 ] && echo "🚨 DISK KRITIS: ${AVAIL_MB}MB"
 
@@ -506,8 +534,8 @@ jobs:
             fi
             echo ""
             echo "▶ [C] ALL ERRORS:"
-            grep -n -E 'error:|undefined reference|No space left' build.log | head -50 \
-              || echo "  (tidak ada)"
+            grep -n -E 'error:|undefined reference|No space left' \
+              build.log | head -50 || echo "  (tidak ada)"
           else
             echo "❌ build.log tidak ada / kosong"
           fi
@@ -544,7 +572,8 @@ jobs:
         sed -i 's|is_slot_device=.*|is_slot_device=1;|'                    anykernel.sh
 
         BRANCH="${{ github.event.inputs.kernel_branch }}"
-        sed -i "s|kernel\.string=.*|kernel.string=SukiSU Ultra LG V60 (${BRANCH})|" anykernel.sh
+        sed -i "s|kernel\.string=.*|kernel.string=SukiSU Ultra LG V60 (${BRANCH})|" \
+          anykernel.sh
 
         BOOT="../kernel/out/arch/arm64/boot"
         COPIED=0
@@ -604,7 +633,7 @@ jobs:
       if: always()
       run: |
         echo "═══════════════════════════════════════════════════════"
-        echo "              BUILD SUMMARY — SukiSU Ultra v4"
+        echo "              BUILD SUMMARY — SukiSU Ultra v5"
         echo "═══════════════════════════════════════════════════════"
 
         if ls SukiSU-Ultra-V60-*.zip 1>/dev/null 2>&1; then
@@ -623,13 +652,14 @@ jobs:
           echo "  2. Cek step 'Compile kernel' bagian [A][B][C]"
           echo "  3. Download artifact 'build-logs'"
           echo ""
-          echo "🔧 Fixes di v4:"
-          echo "  - ccflags-y += -I$(srctree)/drivers/kernelsu [FIX UTAMA v4]"
-          echo "    → Fix fatal error: uapi/feature.h / uapi/app_profile.h not found"
-          echo "  - obj-$(CONFIG_KSU) bukan obj-y [v3]"
-          echo "  - cp -r bukan symlink [v3]"
-          echo "  - V=1 verbose isolation test [v3]"
-          echo "  - Auto-detect SukiSU struktur [v3]"
+          echo "🔧 Fixes di v5:"
+          echo "  - Fix grep quoting: single-quote untuk literal string check"
+          echo "    → Root cause: double-quote expand \$(srctree) sebagai subshell"
+          echo "    → Membuat kondisi check ccflags-y SELALU FALSE"
+          echo "    → Inject tidak berjalan meskipun kode ada"
+          echo "  - Tambah mandatory verification setelah inject"
+          echo "  - Tambah fallback symlink uapi/ jika direktori tidak ada"
+          echo "  - Sederhanakan logic inject (atomic & idempotent)"
         fi
 
         echo ""
