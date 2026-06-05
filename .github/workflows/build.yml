@@ -1,4 +1,4 @@
-name: 🔨 Build LG V60 Kernel + SuKiSu Ultra (Final Fix All)
+name: 🔨 Build LG V60 Kernel + SuKiSu Ultra
 
 on:
   workflow_dispatch:
@@ -10,51 +10,33 @@ on:
         type: choice
         options:
           - lineage-23.2
+          - lineage-23.0
           - lineage-22.2
-          - lineage-21
-      sukisu_variant:
-        description: 'Varian SuKiSu (susfs-main = lebih lengkap, main = dasar)'
-        required: true
-        default: 'susfs-main'
-        type: choice
-        options:
-          - susfs-main
-          - main
 
 jobs:
   build:
-    name: Build Kernel LG V60
     runs-on: ubuntu-22.04
 
     steps:
-    - name: 📥 Checkout repo workflow
+
+    - name: 📥 Checkout repo
       uses: actions/checkout@v4
 
-    - name: 🗑️ Bersihkan disk
+    - name: 🗑️ Bebaskan disk
       run: |
-        echo "Ruang disk sebelum:"
-        df -h /
-        sudo rm -rf \
-          /usr/share/dotnet \
-          /usr/local/lib/android \
-          /opt/ghc \
-          /usr/local/.ghcup \
-          /usr/share/swift
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache
         sudo apt-get clean
-        echo "Ruang disk setelah:"
-        df -h /
+        df -h / | tail -1
 
-    - name: 📦 Install tools build
+    - name: 📦 Install tools
       run: |
         sudo apt-get update -y
         sudo apt-get install -y \
-          git bc bison flex libssl-dev libelf-dev \
-          libncurses5-dev python3 python-is-python3 \
-          zip unzip wget curl \
-          gcc-aarch64-linux-gnu \
-          gcc-arm-linux-gnueabi \
-          binutils-aarch64-linux-gnu \
-          binutils-arm-linux-gnueabi
+          git bc bison flex libssl-dev libelf-dev libncurses5-dev \
+          python3 python-is-python3 zip unzip wget curl \
+          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+          binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
     - name: ⚙️ Install Clang 17
       run: |
@@ -63,169 +45,162 @@ jobs:
         sudo ./llvm.sh 17
         for tool in clang clang++ ld.lld llvm-ar llvm-nm \
                     llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
-          src="/usr/bin/${tool}-17"
-          dst="/usr/local/bin/${tool}"
-          [ -f "$src" ] && sudo ln -sf "$src" "$dst"
+          [ -f "/usr/bin/${tool}-17" ] && \
+            sudo ln -sf "/usr/bin/${tool}-17" "/usr/local/bin/${tool}"
         done
-        clang --version
+        clang --version | head -1
 
-    - name: 📥 Download kernel source
+    - name: 📥 Clone kernel source (branch ${{ github.event.inputs.kernel_branch }})
       run: |
         git clone --depth=1 \
           https://github.com/LineageOS/android_kernel_lge_sm8250 \
-          -b ${{ github.event.inputs.kernel_branch }} \
-          kernel
-        head -5 kernel/Makefile
+          -b ${{ github.event.inputs.kernel_branch }} kernel
+        echo "Kernel version: $(head -3 kernel/Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL' | awk '{print $3}' | tr '\n' '.' | sed 's/\.$//')"
 
-    - name: 🔍 Deteksi defconfig
-      id: defconfig
-      run: |
-        if [ -f "kernel/arch/arm64/configs/vendor/timelm_defconfig" ]; then
-          echo "defconfig=vendor/timelm_defconfig" >> $GITHUB_OUTPUT
-        elif [ -f "kernel/arch/arm64/configs/timelm_defconfig" ]; then
-          echo "defconfig=timelm_defconfig" >> $GITHUB_OUTPUT
-        elif [ -f "kernel/arch/arm64/configs/vendor/kona-perf_defconfig" ]; then
-          echo "defconfig=vendor/kona-perf_defconfig" >> $GITHUB_OUTPUT
-        elif [ -f "kernel/arch/arm64/configs/kona-perf_defconfig" ]; then
-          echo "defconfig=kona-perf_defconfig" >> $GITHUB_OUTPUT
-        else
-          echo "❌ Defconfig tidak ditemukan"
-          exit 1
-        fi
-
-    - name: 💉 Inject SuKiSu Ultra
+    # ── PENTING: Inject SuKiSu branch "builtin" (bukan main/susfs-main) ──────
+    # Branch "builtin" = untuk non-GKI kernel, tidak perlu KPROBES
+    - name: 💉 Inject SuKiSu Ultra (branch builtin)
       run: |
         cd kernel
         curl -LSs \
           "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
-          | bash -s ${{ github.event.inputs.sukisu_variant }}
+          | bash -s builtin
+        echo ""
+        echo "Verifikasi integrasi:"
+        echo "  drivers/kernelsu symlink: $(ls -la drivers/kernelsu 2>/dev/null || echo 'TIDAK ADA')"
+        echo "  Makefile entry: $(grep 'kernelsu' drivers/Makefile 2>/dev/null || echo 'TIDAK ADA')"
+        echo "  Kconfig entry: $(grep 'kernelsu' drivers/Kconfig 2>/dev/null || echo 'TIDAK ADA')"
 
-    - name: 🔧 Terapkan manual hooks
+    - name: 🔧 Terapkan manual hooks ke kernel source
       run: |
         python3 scripts/apply_hooks.py kernel
 
-    # ============================================================
-    # PATCH UNTUK SEMUA ERROR YANG DIKENALI
-    # ============================================================
-    
-    - name: 🔧 Fix 1 - esoc.h missing macro
-      run: |
-        cd kernel
-        ESOC_H="drivers/esoc/esoc.h"
-        if [ -f "$ESOC_H" ]; then
-          if grep -q '^[[:space:]]*do {' "$ESOC_H"; then
-            sed -i '/^[[:space:]]*do {/i #define ESOC_DBG(fmt, ...) \\' "$ESOC_H"
-          fi
-        fi
-
-    - name: 🔧 Fix 2 - esoc_dev.c missing esoc_mdm_log() function
-      run: |
-        cd kernel
-        ESOC_DEV_C="drivers/esoc/esoc_dev.c"
-        if [ -f "$ESOC_DEV_C" ]; then
-          # Sisipkan definisi fungsi setelah baris yang mengandung #include
-          # Gunakan echo dengan escaped newline
-          echo -e '\n/* Added by workflow fix - define missing esoc_mdm_log */\nvoid esoc_mdm_log(const char *fmt, ...) { }\n' >> "$ESOC_DEV_C"
-          echo "✅ esoc_dev.c ditambahkan definisi esoc_mdm_log"
-        fi
-
-    - name: 🔧 Fix 3 - cam_ois_core.c unused variable
-      run: |
-        cd kernel
-        CAM_OIS_C="techpack/camera/drivers/cam_sensor_module/cam_ois/cam_ois_core.c"
-        if [ -f "$CAM_OIS_C" ]; then
-          sed -i 's/struct ois_userdata \*ois_userdata/struct ois_userdata __maybe_unused *ois_userdata/' "$CAM_OIS_C"
-          echo "✅ cam_ois_core.c diperbaiki"
-        fi
-
-    - name: 🔧 Fix 4 - Disable -Werror globally
-      run: |
-        cd kernel
-        find . -name "Makefile" -type f -exec sed -i 's/-Werror /-Wno-error /g' {} \;
-        sed -i 's/-Werror /-Wno-error /g' arch/arm64/Makefile 2>/dev/null || true
-        echo "✅ -Werror dinonaktifkan"
-
     - name: 🏗️ Build kernel
-      id: build
-      continue-on-error: true
       run: |
+        set -e
+        set -o pipefail
         cd kernel
-        export ARCH=arm64
-        export SUBARCH=arm64
-        export LLVM=1 LLVM_IAS=1
 
-        make O=out \
-          ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-          ${{ steps.defconfig.outputs.defconfig }}
+        echo "💾 Disk tersedia: $(df -h / | tail -1 | awk '{print $4}')"
 
+        # ── [1/4] Generate .config dari kona-perf_defconfig ──
+        echo ""
+        echo "▶ [1/4] Base defconfig: vendor/kona-perf_defconfig"
+        make O=out ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+          vendor/kona-perf_defconfig
+
+        # ── [2/4] Merge timelm.config fragment (konfigurasi khusus LG V60) ──
+        echo ""
+        echo "▶ [2/4] Merge timelm.config fragment"
+        ./scripts/kconfig/merge_config.sh \
+          -m -O out/ \
+          out/.config \
+          arch/arm64/configs/vendor/timelm.config
+        echo "  Fragment timelm.config berhasil di-merge"
+
+        # ── [3/4] Tambahkan KSU configs ──
+        echo ""
+        echo "▶ [3/4] Aktifkan KSU configs"
         ./scripts/config --file out/.config \
-          --enable CONFIG_KSU --enable CONFIG_KSU_MANUAL_HOOK \
-          --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL \
-          --enable CONFIG_KPM --disable CONFIG_KPROBES
+          --enable  CONFIG_KSU \
+          --enable  CONFIG_KPM
 
-        make O=out olddefconfig
+        # Resolve semua dependensi otomatis
+        make O=out ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+          olddefconfig
 
-        make -j$(nproc) O=out \
-          ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-          2>&1 | tee build.log
+        # Konfirmasi KSU aktif setelah olddefconfig
+        echo "  CONFIG_KSU  = $(grep '^CONFIG_KSU=' out/.config || echo 'TIDAK DITEMUKAN')"
+        echo "  CONFIG_KPM  = $(grep '^CONFIG_KPM=' out/.config || echo 'TIDAK DITEMUKAN')"
 
-        if [ ! -f "out/arch/arm64/boot/Image" ] && [ ! -f "out/arch/arm64/boot/Image.gz" ] && [ ! -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
-          echo "❌ Kernel image tidak ditemukan"
+        # ── [4/4] Kompilasi ──
+        echo ""
+        echo "▶ [4/4] Kompilasi kernel (~30-50 menit)..."
+        echo "💾 Disk sebelum build: $(df -h / | tail -1 | awk '{print $4}')"
+        make O=out ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+          -j$(nproc) 2>&1 | tee build.log
+        BUILD_EXIT=${PIPESTATUS[0]}
+
+        echo ""
+        echo "💾 Disk setelah build: $(df -h / | tail -1 | awk '{print $4}')"
+
+        # ── Cek hasil ──
+        if [ $BUILD_EXIT -ne 0 ] || ! ls out/arch/arm64/boot/Image* 2>/dev/null; then
+          echo ""
+          echo "❌ BUILD GAGAL (exit: $BUILD_EXIT)"
+          AVAIL=$(df / | tail -1 | awk '{print $4}')
+          [ "$AVAIL" -lt 512000 ] && \
+            echo "🚨 DISK HAMPIR HABIS (${AVAIL}KB) — kemungkinan penyebab"
+          echo ""
+          echo "══ ERROR PERTAMA ══"
+          ERRLINE=$(grep -nE \
+            "error:|Error [0-9]+|fatal error:|undefined reference|No rule to make|No space left|cannot open|ld.lld:" \
+            build.log \
+            | grep -vE "Werror|werror|^[[:space:]]+(CC|AR|LD|AS|GZIP|UPD)" \
+            | head -1 | cut -d: -f1)
+          if [ -n "$ERRLINE" ]; then
+            START=$(( ERRLINE > 8 ? ERRLINE - 8 : 1 ))
+            sed -n "${START},$((ERRLINE + 20))p" build.log
+          else
+            echo "(tidak ada error eksplisit di log)"
+            grep "make\[" build.log | grep -vE "Entering|Leaving" | tail -5
+            echo "---"
+            TOTAL=$(wc -l < build.log)
+            MID=$(( TOTAL / 2 ))
+            echo "Tengah log (baris $((MID-15)) - $((MID+15))):"
+            sed -n "$((MID-15)),$((MID+15))p" build.log
+          fi
           exit 1
         fi
 
-    - name: 📋 Upload build.log
+        echo "✅ Build sukses!"
+        ls -lh out/arch/arm64/boot/
+
+    - name: 📋 Upload build.log (selalu)
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: build-log
         path: kernel/build.log
-        retention-days: 7
+        retention-days: 3
 
-    - name: 🔍 Tampilkan error jika gagal
-      if: steps.build.outcome == 'failure'
-      run: |
-        echo "=== 100 baris terakhir build.log ==="
-        tail -100 kernel/build.log
-        echo ""
-        echo "=== Baris yang mengandung 'error:' ==="
-        grep -n "error:" kernel/build.log | head -30
-        exit 1
-
-    - name: 📦 Buat paket kernel (AnyKernel3)
-      if: steps.build.outcome == 'success'
+    - name: 📦 Buat paket AnyKernel3
       run: |
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
         cd AnyKernel3
-        sed -i 's/do\.devicecheck=0/do.devicecheck=1/' anykernel.sh
-        sed -i 's/device\.name1=.*/device.name1=timelm/' anykernel.sh
-        sed -i 's/device\.name2=.*/device.name2=LMV600/' anykernel.sh
+        sed -i 's/do\.devicecheck=0/do.devicecheck=1/'     anykernel.sh
+        sed -i 's/device\.name1=.*/device.name1=timelm/'   anykernel.sh
+        sed -i 's/device\.name2=.*/device.name2=LMV600/'   anykernel.sh
         sed -i 's/device\.name3=.*/device.name3=LMV600VM/' anykernel.sh
         sed -i 's/device\.name4=.*/device.name4=LMV600EA/' anykernel.sh
         sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
-        sed -i 's/is_slot_device=.*/is_slot_device=1;/' anykernel.sh
-        sed -i 's/kernel\.string=.*/kernel.string=SuKiSu-Ultra Kernel for LG V60/' anykernel.sh
+        sed -i 's/is_slot_device=.*/is_slot_device=1;/'    anykernel.sh
+        sed -i 's/kernel\.string=.*/kernel.string=SuKiSu-Ultra Builtin for LG V60 ThinQ/' anykernel.sh
 
-        BOOT_DIR="../kernel/out/arch/arm64/boot"
-        if [ -f "$BOOT_DIR/Image" ]; then
-          cp "$BOOT_DIR/Image" .
-        elif [ -f "$BOOT_DIR/Image.gz" ]; then
-          cp "$BOOT_DIR/Image.gz" .
-        elif [ -f "$BOOT_DIR/Image.gz-dtb" ]; then
-          cp "$BOOT_DIR/Image.gz-dtb" .
-        else
-          echo "Tidak ada kernel image"
-          exit 1
-        fi
+        BOOT="../kernel/out/arch/arm64/boot"
+        for img in Image Image.gz Image.gz-dtb; do
+          [ -f "$BOOT/$img" ] && cp "$BOOT/$img" ./ && echo "✅ $img di-copy" && break
+        done
+        mkdir -p dtbs
+        find "$BOOT/dts" -name "*.dtb" -exec cp {} dtbs/ \; 2>/dev/null || true
 
-        ZIPNAME="SuKiSu-Ultra-V60-$(date +%Y%m%d-%H%M).zip"
-        zip -r9 "../$ZIPNAME" . -x ".git/*" -x "README.md"
-        echo "ZIPNAME=$ZIPNAME" >> $GITHUB_ENV
+        ZIP="SuKiSu-Ultra-V60-$(date +%Y%m%d-%H%M).zip"
+        zip -r9 "../$ZIP" . -x ".git/*" -x "README.md" -x "*.placeholder"
+        echo "✅ ZIP: $ZIP ($(du -h ../$ZIP | cut -f1))"
 
     - name: ⬆️ Upload kernel ZIP
-      if: steps.build.outcome == 'success'
       uses: actions/upload-artifact@v4
       with:
         name: SuKiSu-Ultra-V60-Kernel
@@ -235,8 +210,17 @@ jobs:
     - name: 📊 Ringkasan
       if: always()
       run: |
-        if [ "${{ steps.build.outcome }}" == "success" ]; then
-          echo "✅ BUILD BERHASIL"
+        echo ""
+        if ls SuKiSu-Ultra-V60-*.zip 2>/dev/null; then
+          echo "╔══════════════════════╗"
+          echo "║   ✅ BUILD BERHASIL  ║"
+          echo "╚══════════════════════╝"
+          ls -lh SuKiSu-Ultra-V60-*.zip
+          echo ""
+          echo "→ Download ZIP di tab 'Summary' → bagian 'Artifacts'"
         else
-          echo "❌ BUILD GAGAL - Download artifact 'build-log'"
+          echo "╔══════════════════════╗"
+          echo "║   ❌ BUILD GAGAL     ║"
+          echo "╚══════════════════════╝"
+          echo "→ Download 'build-log' untuk melihat error lengkap"
         fi
