@@ -3,17 +3,29 @@
 ═══════════════════════════════════════════════════════════════
   SukiSU Ultra Manual Hook Patcher
   Untuk: LG V60 ThinQ (timelm) — Linux kernel 4.19 non-GKI
+  
+  Perubahan dari versi sebelumnya:
+  - FIX: Atomic write via temp file + os.replace()
+  - FIX: Counter tidak dobel-increment saat baca() gagal
+  - FIX: failed_files menggunakan set() untuk mencegah duplikasi
+  - FIX: anchor replacement tidak menghilangkan indentasi
+  - FIX: Backup .bak dihapus setelah write sukses
+  - FIX: Encoding menggunakan surrogateescape untuk fidelitas byte
+  - FIX: EXPORT_SYMBOL_GPL dihilangkan untuk kernel 4.19 non-GKI
 ═══════════════════════════════════════════════════════════════
 """
 
 import os
 import sys
 import shutil
+import tempfile
 
 KERNEL_DIR = sys.argv[1] if len(sys.argv) > 1 else "."
 
 hasil = {"berhasil": 0, "sudah_ada": 0, "gagal": 0}
-failed_files = []
+
+# FIX: Gunakan set() untuk mencegah duplikasi entri failed_files
+failed_files: set = set()
 
 # ─────────────────────────────────────────────────────────────
 # Helper functions
@@ -23,30 +35,67 @@ def path(relative):
     return os.path.join(KERNEL_DIR, relative)
 
 def baca(file_rel):
+    """
+    Baca file dan return kontennya sebagai string.
+    Return None jika file tidak ditemukan atau error.
+    FIX: Fungsi ini TIDAK memodifikasi counter hasil[] atau failed_files.
+         Tanggung jawab tersebut ada di fungsi patch pemanggil.
+    """
     p = path(file_rel)
     try:
-        with open(p, "r", encoding="utf-8", errors="replace") as f:
+        # FIX: Gunakan surrogateescape agar byte non-UTF8 dipreservasi
+        # dengan benar saat file dibaca dan ditulis kembali.
+        # errors='replace' sebelumnya bisa merusak binary content secara diam-diam.
+        with open(p, "r", encoding="utf-8", errors="surrogateescape") as f:
             return f.read()
     except FileNotFoundError:
-        log_gagal(f"{file_rel}: FILE TIDAK DITEMUKAN")
-        failed_files.append(file_rel)
+        print(f"  ❌ {file_rel}: FILE TIDAK DITEMUKAN")
         return None
     except Exception as e:
-        log_gagal(f"{file_rel}: Error membaca: {e}")
-        failed_files.append(file_rel)
+        print(f"  ❌ {file_rel}: Error membaca: {e}")
         return None
 
 def tulis(file_rel, konten):
+    """
+    Tulis konten ke file secara atomic menggunakan temp file + os.replace().
+    FIX: Atomic write mencegah file korup parsial jika proses diinterupsi.
+    FIX: Backup .bak dihapus setelah write berhasil agar tidak polusi source tree.
+    """
     p = path(file_rel)
+    backup = p + ".bak"
+
+    # Buat backup sebelum modifikasi
     if os.path.exists(p):
-        backup = p + ".bak"
         shutil.copy2(p, backup)
+
     try:
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(konten)
+        # FIX: Tulis ke temporary file dulu, lalu atomic rename
+        # os.replace() adalah atomic di POSIX (single filesystem)
+        dir_name = os.path.dirname(p)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            errors="surrogateescape",
+            dir=dir_name,
+            delete=False,
+            suffix=".tmp"
+        ) as tmp:
+            tmp.write(konten)
+            tmp_path = tmp.name
+
+        os.replace(tmp_path, p)
+
+        # FIX: Hapus backup setelah write sukses agar tidak polusi source tree
+        if os.path.exists(backup):
+            os.unlink(backup)
+
     except Exception as e:
-        if os.path.exists(p + ".bak"):
-            shutil.move(p + ".bak", p)
+        # Rollback dari backup jika ada exception
+        if os.path.exists(backup):
+            shutil.move(backup, p)
+        # Bersihkan temp file yang mungkin tertinggal
+        if 'tmp_path' in dir() and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
         raise e
 
 def sudah_dipatch(konten, marker):
@@ -60,9 +109,15 @@ def log_skip(msg):
     hasil["sudah_ada"] += 1
     print(f"  ⏭️  {msg}")
 
-def log_gagal(msg):
+def log_gagal(msg, file_rel=None):
+    """
+    FIX: log_gagal hanya dipanggil dari fungsi patch tingkat atas,
+    bukan dari baca(). file_rel opsional untuk mencatat ke failed_files.
+    """
     hasil["gagal"] += 1
     print(f"  ❌ {msg}")
+    if file_rel:
+        failed_files.add(file_rel)  # FIX: set.add() otomatis mencegah duplikasi
 
 def log_info(msg):
     print(f"  ℹ️  {msg}")
@@ -73,7 +128,10 @@ def log_info(msg):
 def patch_exec_c():
     FILE = "fs/exec.c"
     c = baca(FILE)
-    if c is None: return
+    if c is None:
+        # FIX: Counter dan failed_files dikelola di sini, bukan di baca()
+        log_gagal(f"{FILE}: FILE TIDAK DITEMUKAN", FILE)
+        return
 
     if sudah_dipatch(c, "ksu_execveat_hook"):
         log_skip(FILE)
@@ -97,30 +155,27 @@ def patch_exec_c():
         "\telse\n"
         "\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n"
         "#endif\n"
-        "\t"
     )
 
     FUNGSI = "static int do_execveat_common("
     if FUNGSI not in c:
-        log_gagal(f"{FILE}: fungsi do_execveat_common tidak ditemukan")
-        failed_files.append(FILE)
+        log_gagal(f"{FILE}: fungsi do_execveat_common tidak ditemukan", FILE)
         return
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
     berhasil = False
-    # FIX: Sertakan leading \t pada anchor agar tab dikonsumsi oleh replace,
-    # menghindari orphaned \t sebelum HOOK di baris sebelumnya.
+    # FIX: Insert HOOK sebelum anchor TANPA memodifikasi anchor itu sendiri.
+    # Versi sebelumnya menggunakan anchor.lstrip() yang menghilangkan leading \t
+    # dari anchor, menyebabkan do_execveat_common kehilangan indentasi.
     for anchor in ["\treturn __do_execve_file(", "\t__do_execve_file("]:
         if anchor in c:
-            # anchor.lstrip() mengkonsumsi tab; HOOK berakhir \t untuk re-indent
-            c = c.replace(anchor, HOOK + anchor.lstrip(), 1)
+            c = c.replace(anchor, HOOK + anchor, 1)
             berhasil = True
             break
 
     if not berhasil:
-        log_gagal(f"{FILE}: titik insert tidak ditemukan")
-        failed_files.append(FILE)
+        log_gagal(f"{FILE}: titik insert tidak ditemukan", FILE)
         return
 
     tulis(FILE, c)
@@ -132,7 +187,9 @@ def patch_exec_c():
 def patch_open_c():
     FILE = "fs/open.c"
     c = baca(FILE)
-    if c is None: return
+    if c is None:
+        log_gagal(f"{FILE}: FILE TIDAK DITEMUKAN", FILE)
+        return
 
     if sudah_dipatch(c, "ksu_handle_faccessat"):
         log_skip(FILE)
@@ -146,8 +203,7 @@ def patch_open_c():
         "#endif\n"
     )
 
-    # FIX: HOOK tidak lagi berakhir dengan "\t" — penggabungan dengan anchor
-    # yang sudah memiliki indentasinya sendiri.
+    # HOOK: #ifdef di kolom 0 (preprocessor convention), isi diindentasi 1 tab
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
@@ -161,14 +217,12 @@ def patch_open_c():
             break
 
     if FUNGSI_TARGET is None:
-        log_gagal(f"{FILE}: fungsi faccessat tidak ditemukan")
-        failed_files.append(FILE)
+        log_gagal(f"{FILE}: fungsi faccessat tidak ditemukan", FILE)
         return
 
     c = c.replace(FUNGSI_TARGET, DEKLARASI + FUNGSI_TARGET, 1)
 
-    # FIX: Hapus "\t" + prefix pada HOOK — #ifdef harus di kolom 0.
-    # Anchor sudah mengandung leading \t miliknya sendiri.
+    # FIX: Insert HOOK sebelum anchor tanpa memodifikasi anchor
     for anchor in ["\tif (mode & ~S_IRWXO)", "\tunsigned int lookup_flags = LOOKUP_FOLLOW;"]:
         if anchor in c:
             c = c.replace(anchor, HOOK + anchor, 1)
@@ -176,8 +230,7 @@ def patch_open_c():
             log_ok(FILE)
             return
 
-    log_gagal(f"{FILE}: titik insert tidak ditemukan")
-    failed_files.append(FILE)
+    log_gagal(f"{FILE}: titik insert tidak ditemukan", FILE)
 
 # ─────────────────────────────────────────────────────────────
 # PATCH 3: fs/read_write.c
@@ -185,7 +238,9 @@ def patch_open_c():
 def patch_read_write_c():
     FILE = "fs/read_write.c"
     c = baca(FILE)
-    if c is None: return
+    if c is None:
+        log_gagal(f"{FILE}: FILE TIDAK DITEMUKAN", FILE)
+        return
 
     if sudah_dipatch(c, "ksu_vfs_read_hook"):
         log_skip(FILE)
@@ -200,7 +255,6 @@ def patch_read_write_c():
         "#endif\n"
     )
 
-    # FIX: Hapus trailing "\t" dari HOOK; anchor sudah memiliki indentasinya.
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tif (unlikely(ksu_vfs_read_hook))\n"
@@ -210,22 +264,20 @@ def patch_read_write_c():
 
     FUNGSI = "ssize_t vfs_read("
     if FUNGSI not in c:
-        log_gagal(f"{FILE}: fungsi vfs_read tidak ditemukan")
-        failed_files.append(FILE)
+        log_gagal(f"{FILE}: fungsi vfs_read tidak ditemukan", FILE)
         return
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
-    # FIX: Hapus "\t" + prefix; anchor sudah memiliki leading \t.
     ANCHOR = "\tif (!(file->f_mode & FMODE_READ))"
     if ANCHOR in c:
+        # FIX: Insert HOOK sebelum anchor tanpa memodifikasi anchor
         c = c.replace(ANCHOR, HOOK + ANCHOR, 1)
         tulis(FILE, c)
         log_ok(FILE)
         return
 
-    log_gagal(f"{FILE}: titik insert tidak ditemukan")
-    failed_files.append(FILE)
+    log_gagal(f"{FILE}: titik insert tidak ditemukan", FILE)
 
 # ─────────────────────────────────────────────────────────────
 # PATCH 4: fs/stat.c
@@ -233,7 +285,9 @@ def patch_read_write_c():
 def patch_stat_c():
     FILE = "fs/stat.c"
     c = baca(FILE)
-    if c is None: return
+    if c is None:
+        log_gagal(f"{FILE}: FILE TIDAK DITEMUKAN", FILE)
+        return
 
     if sudah_dipatch(c, "ksu_handle_stat"):
         log_skip(FILE)
@@ -247,9 +301,6 @@ def patch_stat_c():
         "#endif\n"
     )
 
-    # FIX: Insert DEKLARASI sekali di luar loop untuk menghindari duplikasi.
-    # Jika vfs_statx ditemukan tapi anchor-nya tidak ada, lalu vfs_fstatat juga
-    # ditemukan, DEKLARASI tidak akan di-insert dua kali.
     fungsi_anchor = None
     for fungsi, var_flags in [
         ("int vfs_statx(", "&flags"),
@@ -260,8 +311,7 @@ def patch_stat_c():
             break
 
     if fungsi_anchor is None:
-        log_gagal(f"{FILE}: fungsi vfs_statx/vfs_fstatat tidak ditemukan")
-        failed_files.append(FILE)
+        log_gagal(f"{FILE}: fungsi vfs_statx/vfs_fstatat tidak ditemukan", FILE)
         return
 
     fungsi, var_flags = fungsi_anchor
@@ -272,19 +322,20 @@ def patch_stat_c():
         "#endif\n"
     )
 
-    # Insert DEKLARASI tepat sekali, sebelum fungsi yang ditemukan
-    c = c.replace(fungsi, DEKLARASI + fungsi, 1)
+    # FIX: Simpan c_original untuk rollback jika anchor tidak ditemukan
+    # setelah DEKLARASI sudah di-insert (mencegah state korup in-memory)
+    c_with_decl = c.replace(fungsi, DEKLARASI + fungsi, 1)
 
-    # FIX: Hapus "\t" + prefix; anchor sudah memiliki leading \t.
     for anchor in ["\tint error = -EINVAL;\n", "\tunsigned int lookup_flags"]:
-        if anchor in c:
-            c = c.replace(anchor, HOOK + anchor, 1)
-            tulis(FILE, c)
+        if anchor in c_with_decl:
+            # FIX: Insert HOOK sebelum anchor tanpa memodifikasi anchor
+            c_final = c_with_decl.replace(anchor, HOOK + anchor, 1)
+            tulis(FILE, c_final)
             log_ok(FILE)
             return
 
-    log_gagal(f"{FILE}: titik insert tidak ditemukan setelah {fungsi}")
-    failed_files.append(FILE)
+    # FIX: Jika anchor tidak ditemukan, jangan tulis c yang sudah dimodifikasi
+    log_gagal(f"{FILE}: titik insert tidak ditemukan setelah {fungsi}", FILE)
 
 # ─────────────────────────────────────────────────────────────
 # PATCH 5: drivers/input/input.c (CRITICAL!)
@@ -292,7 +343,9 @@ def patch_stat_c():
 def patch_input_c():
     FILE = "drivers/input/input.c"
     c = baca(FILE)
-    if c is None: return
+    if c is None:
+        log_gagal(f"{FILE}: FILE TIDAK DITEMUKAN", FILE)
+        return
 
     if sudah_dipatch(c, "ksu_input_hook"):
         log_skip(FILE)
@@ -307,7 +360,6 @@ def patch_input_c():
         "#endif\n"
     )
 
-    # FIX: Hapus trailing "\t"; anchor sudah memiliki indentasinya.
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tif (unlikely(ksu_input_hook))\n"
@@ -317,13 +369,12 @@ def patch_input_c():
 
     FUNGSI = "static void input_handle_event("
     if FUNGSI not in c:
-        log_gagal(f"{FILE}: fungsi input_handle_event tidak ditemukan")
-        failed_files.append(FILE)
+        log_gagal(f"{FILE}: fungsi input_handle_event tidak ditemukan", FILE)
         return
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
-    # FIX: Hapus "\t" + prefix.
+    # FIX: Insert HOOK sebelum anchor tanpa memodifikasi anchor
     for anchor in ["\tif (disposition != INPUT_IGNORE_EVENT", "\tswitch (disposition)"]:
         if anchor in c:
             c = c.replace(anchor, HOOK + anchor, 1)
@@ -331,8 +382,7 @@ def patch_input_c():
             log_ok(FILE)
             return
 
-    log_gagal(f"{FILE}: titik insert tidak ditemukan")
-    failed_files.append(FILE)
+    log_gagal(f"{FILE}: titik insert tidak ditemukan", FILE)
 
 # ─────────────────────────────────────────────────────────────
 # PATCH 6: fs/devpts/inode.c
@@ -340,7 +390,9 @@ def patch_input_c():
 def patch_devpts_c():
     FILE = "fs/devpts/inode.c"
     c = baca(FILE)
-    if c is None: return
+    if c is None:
+        log_gagal(f"{FILE}: FILE TIDAK DITEMUKAN", FILE)
+        return
 
     if sudah_dipatch(c, "ksu_handle_devpts"):
         log_skip(FILE)
@@ -353,7 +405,6 @@ def patch_devpts_c():
         "#endif\n"
     )
 
-    # FIX: Hapus trailing "\t"; anchor sudah memiliki indentasinya.
     HOOK = (
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_devpts(dentry->d_inode);\n"
@@ -362,44 +413,44 @@ def patch_devpts_c():
 
     FUNGSI = "void *devpts_get_priv("
     if FUNGSI not in c:
-        log_gagal(f"{FILE}: fungsi devpts_get_priv tidak ditemukan")
-        failed_files.append(FILE)
+        log_gagal(f"{FILE}: fungsi devpts_get_priv tidak ditemukan", FILE)
         return
 
     c = c.replace(FUNGSI, DEKLARASI + FUNGSI, 1)
 
-    # FIX: Hapus "\t" + prefix.
     ANCHOR = "\tif (dentry->d_sb->s_magic != DEVPTS_SUPER_MAGIC)"
     if ANCHOR in c:
+        # FIX: Insert HOOK sebelum anchor tanpa memodifikasi anchor
         c = c.replace(ANCHOR, HOOK + ANCHOR, 1)
         tulis(FILE, c)
         log_ok(FILE)
         return
 
-    log_gagal(f"{FILE}: titik insert tidak ditemukan")
-    failed_files.append(FILE)
+    log_gagal(f"{FILE}: titik insert tidak ditemukan", FILE)
 
 # ─────────────────────────────────────────────────────────────
-# PATCH 7: fs/namespace.c (Optional backport)
+# PATCH 7: fs/namespace.c (Optional backport path_umount)
 # ─────────────────────────────────────────────────────────────
 def patch_namespace_c():
     FILE = "fs/namespace.c"
     c = baca(FILE)
-    if c is None: return
+    if c is None:
+        # Namespace.c adalah optional patch — log info bukan gagal
+        log_info(f"{FILE}: file tidak ditemukan, skip optional backport")
+        return
 
     if "int path_umount(" in c:
         log_skip(f"{FILE} (path_umount sudah ada)")
         return
 
-    # FIX: Bungkus seluruh backport dengan #ifdef CONFIG_KSU sehingga fungsi
-    # hanya dikompilasi ketika KSU aktif. Tanpa guard, can_umount() dan
-    # path_umount() selalu masuk ke binary, membuang ukuran dan berisiko
-    # konflik di masa depan.
-    # FIX: Tambahkan EXPORT_SYMBOL_GPL agar KernelSU dapat menggunakan extern
-    # path_umount() tanpa linker error bila suatu saat dibangun sebagai module.
+    # FIX (Kode Lama): EXPORT_SYMBOL_GPL dihilangkan karena:
+    # 1. Kernel 4.19 non-GKI: KSU dikompilasi langsung ke kernel, bukan module
+    # 2. EXPORT_SYMBOL_GPL di dalam #ifdef block dapat menyebabkan masalah
+    #    visibility pada linker script kernel 4.19 tertentu
+    # 3. Untuk forward compat, cukup deklarasi 'extern' di KSU source-nya sendiri
     PATH_UMOUNT_CODE = """
 #ifdef CONFIG_KSU
-/* KernelSU: backport path_umount dari kernel yang lebih baru */
+/* KernelSU/SukiSU Ultra: backport path_umount untuk kernel 4.19 */
 static int can_umount(const struct path *path, int flags)
 {
 \tstruct mount *mnt = real_mount(path->mnt);
@@ -432,7 +483,6 @@ int path_umount(struct path *path, int flags)
 \tmntput_no_expire(mnt);
 \treturn ret;
 }
-EXPORT_SYMBOL_GPL(path_umount);
 #endif /* CONFIG_KSU */
 
 """
@@ -471,16 +521,17 @@ if __name__ == "__main__":
     print("═" * 60)
     print()
 
-    CRITICAL_FILES = ["fs/exec.c", "fs/open.c", "drivers/input/input.c"]
+    CRITICAL_FILES = {"fs/exec.c", "fs/open.c", "drivers/input/input.c"}
 
     if hasil["gagal"] > 0:
         print("⚠️  Ada patch yang gagal:")
-        for f in failed_files:
+        # FIX: Sort untuk output konsisten; failed_files adalah set jadi tidak ada duplikasi
+        for f in sorted(failed_files):
             is_critical = f in CRITICAL_FILES
             marker = "🔴 CRITICAL" if is_critical else "⚠️  OPTIONAL"
             print(f"   {marker}: {f}")
 
-        critical_failed = any(f in CRITICAL_FILES for f in failed_files)
+        critical_failed = bool(failed_files & CRITICAL_FILES)
         if critical_failed:
             print()
             print("❌ Critical patch gagal! Build akan error.")
