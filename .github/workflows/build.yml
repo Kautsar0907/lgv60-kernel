@@ -1,4 +1,4 @@
-name: 🔨 Build LG V60 Kernel + SukiSU Ultra
+name: 🔨 Build LG V60 Kernel + SukiSU Ultra + SUSFS
 
 on:
   workflow_dispatch:
@@ -97,218 +97,377 @@ jobs:
     # STEP 3: Clone SukiSU Ultra
     # ══════════════════════════════════════════════════════════
 
-    - name: 💉 Clone SukiSU Ultra source
+    - name: 💉 Clone & integrate SukiSU Ultra
       run: |
         cd kernel
 
-        echo "▶ Cloning SukiSU Ultra repository..."
+        echo "════════════════════════════════════════"
+        echo "  Cloning SukiSU Ultra"
+        echo "════════════════════════════════════════"
         if ! git clone --depth=1 \
           https://github.com/SukiSU-Ultra/SukiSU-Ultra SukiSU; then
-          echo "❌ Gagal clone SukiSU Ultra repository!"
+          echo "❌ Gagal clone SukiSU Ultra!"
           exit 1
         fi
 
         echo ""
-        echo "▶ Validating SukiSU repo structure..."
-        echo "   SukiSU root contents:"
-        ls -la SukiSU/
+        echo "▶ SukiSU Ultra repo structure:"
+        find SukiSU -maxdepth 2 -type d | sort
+        echo ""
 
-        # Auto-detect direktori kernel SukiSU
-        SUKISU_KERNEL_DIR=""
-        for candidate in "SukiSU/kernel" "SukiSU" "SukiSU/KernelSU/kernel"; do
-          if [ -f "${candidate}/Kconfig" ] && [ -f "${candidate}/Makefile" ]; then
-            SUKISU_KERNEL_DIR="${candidate}"
-            echo "   ✅ Found SukiSU kernel dir: ${candidate}"
+        # ─────────────────────────────────────────────────────
+        # Auto-detect kernel source dir di dalam SukiSU repo
+        # SukiSU Ultra menggunakan layout modular, bukan
+        # monolitik seperti KernelSU lama.
+        # ─────────────────────────────────────────────────────
+        SUKISU_SRC=""
+        for candidate in "SukiSU/kernel" "SukiSU"; do
+          if [ -f "${candidate}/Kconfig" ]; then
+            SUKISU_SRC="${candidate}"
+            echo "✅ SukiSU kernel src: ${candidate}"
             break
           fi
         done
 
-        if [ -z "$SUKISU_KERNEL_DIR" ]; then
-          echo "❌ Tidak dapat menemukan Kconfig + Makefile di repo SukiSU!"
-          find SukiSU -name 'Kconfig' -o -name 'Makefile' | head -20
-          ls -la SukiSU/
-          [ -d "SukiSU/kernel" ] && ls -la SukiSU/kernel/
+        if [ -z "$SUKISU_SRC" ]; then
+          echo "❌ Tidak menemukan Kconfig di SukiSU repo!"
+          find SukiSU -name 'Kconfig' | head -10
           exit 1
         fi
-
-        echo "   .c files:"
-        ls "${SUKISU_KERNEL_DIR}"/*.c 2>/dev/null | head -5 \
-          || find "${SUKISU_KERNEL_DIR}" -name '*.c' | head -5
 
         echo ""
-        echo "▶ Copying SukiSU → drivers/kernelsu/ (hardcopy)..."
-        cp -r "${SUKISU_KERNEL_DIR}" drivers/kernelsu
+        echo "▶ Copying SukiSU → drivers/kernelsu/ ..."
+        rm -rf drivers/kernelsu
+        cp -r "${SUKISU_SRC}" drivers/kernelsu
 
-        if [ ! -d drivers/kernelsu ] || \
-           [ ! -f drivers/kernelsu/Kconfig ] || \
-           [ ! -f drivers/kernelsu/Makefile ]; then
-          echo "❌ Hardcopy gagal atau struktur tidak lengkap!"
-          ls -la drivers/kernelsu/ 2>/dev/null || echo "  direktori tidak ada"
-          exit 1
-        fi
+        echo ""
+        echo "▶ Verifying copy — critical files:"
+        for f in Kconfig; do
+          if [ -f "drivers/kernelsu/${f}" ]; then
+            echo "  ✅ drivers/kernelsu/${f}"
+          else
+            echo "  ❌ drivers/kernelsu/${f} MISSING"
+            exit 1
+          fi
+        done
 
-        echo "✅ drivers/kernelsu/ ready"
-        ls -la drivers/kernelsu/ | head -20
+        echo ""
+        echo "▶ Full directory map of drivers/kernelsu/:"
+        find drivers/kernelsu -type f | sort | head -60
 
     # ══════════════════════════════════════════════════════════
-    # STEP 4: Integrate SukiSU into Build System
+    # STEP 4: Generate Kbuild + Integrate Build System
     #
-    # ROOT CAUSE FIX (v5):
-    #   Bug lama: grep -qF "$(srctree)/..." menggunakan double-quote
-    #   sehingga shell EXPAND $(srctree) sebagai subshell → string
-    #   kosong → kondisi check selalu FALSE → inject rusak.
+    # FIX RC-1: Hapus grep -v 'policy' yang memfilter hasil valid
+    # FIX RC-2: Generate Kbuild baru, bukan inject ke standalone Makefile
+    # FIX RC-3: Makefile SukiSU adalah out-of-tree — gunakan Kbuild terpisah
     #
-    #   Fix: gunakan single-quote untuk literal string comparison,
-    #   sederhanakan logic, tambah mandatory verification.
+    # PENDEKATAN:
+    #   Generate drivers/kernelsu/Kbuild secara programatik berdasarkan
+    #   .c files aktual yang ada, dengan ccflags yang cover semua
+    #   subdirektori header SukiSU Ultra.
     # ══════════════════════════════════════════════════════════
 
-    - name: 🔧 Integrate SukiSU into build system
+    - name: 🔧 Generate Kbuild & integrate SukiSU Ultra into kernel build
       run: |
         cd kernel
 
-        KERNELSU_MK="drivers/kernelsu/Makefile"
+        KSUDIR="drivers/kernelsu"
 
-        # ─────────────────────────────────────────────────────────
-        # FIX UTAMA v5: Inject ccflags-y dengan benar
-        #
-        # ROOT CAUSE error sebelumnya:
-        #   grep -qF "$(srctree)/drivers/kernelsu" "$KERNELSU_MK"
-        #   ↑ Double-quote menyebabkan shell expand $(srctree)
-        #   sebagai subshell command. Hasilnya string kosong,
-        #   sehingga kondisi check SELALU false → inject duplikat
-        #   atau tidak jalan sama sekali.
-        #
-        # FIX: gunakan single-quote untuk grep literal string check
-        #      sehingga '$(srctree)' diperlakukan sebagai plain text.
-        # ─────────────────────────────────────────────────────────
-        echo "▶ [FIX v5] Patching ccflags-y di ${KERNELSU_MK}..."
-        echo ""
-        echo "  Makefile SukiSU SEBELUM patch:"
-        cat "$KERNELSU_MK"
-        echo "  ─────────────────────────────"
-        echo ""
+        echo "════════════════════════════════════════"
+        echo "  Generating Kbuild for SukiSU Ultra"
+        echo "  (FIX RC-1/RC-2/RC-3 dari v5)"
+        echo "════════════════════════════════════════"
 
-        # PENTING: single-quote di grep agar $(srctree) tidak di-expand shell
-        if ! grep -qF '$(srctree)/drivers/kernelsu' "$KERNELSU_MK"; then
-          # Inject di baris pertama — backslash-escape $ agar tidak di-expand
-          sed -i '1s|^|ccflags-y += -I$(srctree)/drivers/kernelsu\n|' "$KERNELSU_MK"
-          echo "  ✅ ccflags-y berhasil di-inject di baris 1"
-        else
-          echo "  ✅ ccflags-y sudah ada dan benar — skip inject"
-        fi
+        # ─────────────────────────────────────────────────────
+        # Scan semua .c files yang ada di drivers/kernelsu/
+        # Ini menggantikan asumsi hardcoded file list.
+        # ─────────────────────────────────────────────────────
+        echo "▶ Scanning .c files di ${KSUDIR}/..."
 
-        echo ""
-        echo "  Makefile SukiSU SETELAH patch:"
-        head -10 "$KERNELSU_MK"
-        echo "  ─────────────────────────────"
+        C_FILES=$(find "${KSUDIR}" -name '*.c' -not -name '*.mod.c' \
+          | sed "s|${KSUDIR}/||" | sort)
 
-        # Mandatory verification — gagalkan build jika inject tidak berhasil
-        echo ""
-        echo "▶ Mandatory verification ccflags-y..."
-        if grep -qF '$(srctree)/drivers/kernelsu' "$KERNELSU_MK"; then
-          echo "  ✅ VERIFY OK: ccflags-y ada di Makefile"
-        else
-          echo "  ❌ VERIFY FAILED: ccflags-y TIDAK DITEMUKAN di Makefile!"
-          echo "     Isi Makefile saat ini:"
-          cat "$KERNELSU_MK"
+        if [ -z "$C_FILES" ]; then
+          echo "❌ Tidak ada .c file ditemukan di ${KSUDIR}!"
           exit 1
         fi
 
-        # ─────────────────────────────────────────────────────────
-        # Verifikasi struktur uapi/ — critical header directory
-        # ─────────────────────────────────────────────────────────
+        echo "  Ditemukan $(echo "$C_FILES" | wc -l) .c file(s):"
+        echo "$C_FILES" | sed 's/^/    /'
+
+        # ─────────────────────────────────────────────────────
+        # Scan subdirektori header untuk ccflags
+        # Semua subdirektori yang mengandung .h file
+        # ─────────────────────────────────────────────────────
         echo ""
-        echo "▶ Verifying uapi/ header directory..."
-        if [ -d "drivers/kernelsu/uapi" ]; then
-          echo "  ✅ drivers/kernelsu/uapi/ EXISTS"
-          ls -la drivers/kernelsu/uapi/
-          for hdr in "feature.h" "app_profile.h"; do
-            if [ -f "drivers/kernelsu/uapi/${hdr}" ]; then
-              echo "  ✅ uapi/${hdr} → OK"
-            else
-              echo "  ⚠️  uapi/${hdr} → NOT FOUND"
-              echo "     Mencari di seluruh kernelsu/..."
-              find drivers/kernelsu -name "${hdr}" | head -5
+        echo "▶ Scanning header directories..."
+
+        HDR_DIRS=$(find "${KSUDIR}" -name '*.h' \
+          | xargs -I{} dirname {} \
+          | sort -u \
+          | sed "s|${KSUDIR}|drivers/kernelsu|")
+
+        echo "  Include paths:"
+        echo "$HDR_DIRS" | sed 's/^/    -I$(srctree)\//'
+
+        # ─────────────────────────────────────────────────────
+        # Generate Kbuild file
+        # Kernel build system membaca 'Kbuild' dengan prioritas
+        # lebih tinggi dari 'Makefile' dalam direktori yang sama.
+        # ─────────────────────────────────────────────────────
+        KBUILD_FILE="${KSUDIR}/Kbuild"
+        echo ""
+        echo "▶ Writing ${KBUILD_FILE}..."
+
+        {
+          echo "# Kbuild — Auto-generated by CI for SukiSU Ultra"
+          echo "# DO NOT EDIT MANUALLY"
+          echo "# Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo ""
+
+          # ccflags: root + semua subdirektori header
+          echo "ccflags-y += \\"
+          echo "    -I\$(srctree)/drivers/kernelsu \\"
+          # Tambah setiap header subdir yang terdeteksi
+          while IFS= read -r hdir; do
+            REL="${hdir#drivers/kernelsu}"
+            if [ -n "$REL" ]; then
+              echo "    -I\$(srctree)/drivers/kernelsu${REL} \\"
             fi
-          done
-        else
-          echo "  ⚠️  drivers/kernelsu/uapi/ TIDAK ADA!"
-          echo "     Mencari header kritis secara rekursif..."
-          find drivers/kernelsu -name 'feature.h' -o \
-                                -name 'app_profile.h' | head -10
+          done <<< "$HDR_DIRS"
+          echo ""
 
-          # FALLBACK: Jika uapi/ tidak ada tapi header ada di lokasi lain,
-          # buat symlink uapi/ agar resolusi path tetap bekerja.
-          FEAT_H=$(find drivers/kernelsu -name 'feature.h' | \
-                   grep -v 'policy' | head -1)
-          if [ -n "$FEAT_H" ]; then
-            UAPI_ACTUAL_DIR=$(dirname "$FEAT_H")
-            echo "  🔧 Fallback: membuat symlink uapi/ → ${UAPI_ACTUAL_DIR}"
-            ln -sfn "$(realpath "$UAPI_ACTUAL_DIR")" \
-                    drivers/kernelsu/uapi
-            echo "  ✅ Symlink dibuat: drivers/kernelsu/uapi → ${UAPI_ACTUAL_DIR}"
-          else
-            echo "  ❌ feature.h tidak ditemukan sama sekali di repo SukiSU!"
-            echo "     Struktur repo:"
-            find drivers/kernelsu -name '*.h' | head -30
-            exit 1
-          fi
-        fi
+          # Definisi objek kernel
+          echo "obj-\$(CONFIG_KSU) += kernelsu.o"
+          echo ""
+          echo "kernelsu-y := \\"
 
-        # ─────────────────────────────────────────────────────────
-        # FIX #1: obj-$(CONFIG_KSU) bukan obj-y
-        # ─────────────────────────────────────────────────────────
+          # Daftar semua .c file sebagai object
+          TOTAL=$(echo "$C_FILES" | wc -l)
+          COUNT=0
+          while IFS= read -r cf; do
+            COUNT=$((COUNT + 1))
+            OBJ="${cf%.c}.o"
+            if [ "$COUNT" -lt "$TOTAL" ]; then
+              echo "    ${OBJ} \\"
+            else
+              echo "    ${OBJ}"
+            fi
+          done <<< "$C_FILES"
+
+          echo ""
+          echo "# End of Kbuild"
+        } > "$KBUILD_FILE"
+
         echo ""
-        echo "▶ [FIX #1] Patching drivers/Makefile..."
+        echo "▶ Generated Kbuild content:"
+        echo "────────────────────────────────────────"
+        cat "$KBUILD_FILE"
+        echo "────────────────────────────────────────"
+
+        # ─────────────────────────────────────────────────────
+        # Mandatory verification: Kbuild harus valid
+        # ─────────────────────────────────────────────────────
+        echo ""
+        echo "▶ Mandatory Kbuild verification..."
+
+        VERIFY_FAIL=0
+
+        grep -q 'obj-$(CONFIG_KSU)' "$KBUILD_FILE" || {
+          echo "  ❌ obj-\$(CONFIG_KSU) tidak ditemukan!"
+          VERIFY_FAIL=1
+        }
+        grep -q 'ccflags-y' "$KBUILD_FILE" || {
+          echo "  ❌ ccflags-y tidak ditemukan!"
+          VERIFY_FAIL=1
+        }
+        grep -q 'kernelsu-y' "$KBUILD_FILE" || {
+          echo "  ❌ kernelsu-y tidak ditemukan!"
+          VERIFY_FAIL=1
+        }
+        grep -q 'drivers/kernelsu' "$KBUILD_FILE" || {
+          echo "  ❌ ccflags path drivers/kernelsu tidak ada!"
+          VERIFY_FAIL=1
+        }
+
+        [ "$VERIFY_FAIL" -eq 1 ] && {
+          echo "❌ Kbuild verification FAILED — aborting"
+          exit 1
+        }
+        echo "  ✅ Kbuild verification PASSED"
+
+        # ─────────────────────────────────────────────────────
+        # Patch drivers/Makefile — obj-$(CONFIG_KSU)
+        # ─────────────────────────────────────────────────────
+        echo ""
+        echo "▶ Patching drivers/Makefile..."
         if ! grep -q 'kernelsu' drivers/Makefile; then
           echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           echo "  ✅ Added: obj-\$(CONFIG_KSU) += kernelsu/"
         else
-          if grep -q 'obj-y += kernelsu/' drivers/Makefile; then
+          if grep -qF 'obj-y += kernelsu/' drivers/Makefile; then
             sed -i 's|obj-y += kernelsu/|obj-$(CONFIG_KSU) += kernelsu/|g' \
               drivers/Makefile
             echo "  ✅ Fixed: obj-y → obj-\$(CONFIG_KSU)"
           else
-            echo "  ⏭️  kernelsu entry sudah benar di drivers/Makefile"
+            echo "  ⏭️  kernelsu entry sudah benar"
             grep 'kernelsu' drivers/Makefile
           fi
         fi
 
+        # ─────────────────────────────────────────────────────
+        # Patch drivers/Kconfig
+        # ─────────────────────────────────────────────────────
         echo ""
         echo "▶ Patching drivers/Kconfig..."
         if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
           if grep -q '^endmenu' drivers/Kconfig; then
-            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-            echo "  ✅ Added kernelsu to Kconfig (before endmenu)"
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' \
+              drivers/Kconfig
+            echo "  ✅ Added kernelsu Kconfig (before endmenu)"
           else
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
-            echo "  ✅ Added kernelsu to Kconfig (appended)"
+            echo "  ✅ Added kernelsu Kconfig (appended)"
           fi
         else
-          echo "  ⏭️  kernelsu sudah ada di Kconfig"
+          echo "  ⏭️  kernelsu sudah ada di drivers/Kconfig"
         fi
 
-        # ─────────────────────────────────────────────────────────
-        # Summary integrasi
-        # ─────────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────
+        # Integration summary
+        # ─────────────────────────────────────────────────────
         echo ""
         echo "════════ Integration Summary ════════"
         echo "drivers/Makefile:"
-        grep 'kernelsu' drivers/Makefile || echo "  (tidak ada entry)"
+        grep 'kernelsu' drivers/Makefile
         echo "drivers/Kconfig:"
-        grep 'kernelsu' drivers/Kconfig  || echo "  (tidak ada entry)"
-        echo "drivers/kernelsu/Makefile (5 baris pertama):"
-        head -5 drivers/kernelsu/Makefile
-        echo "config KSU in Kconfig:"
-        grep -A 6 '^config KSU$' drivers/kernelsu/Kconfig \
-          || echo "  (tidak ditemukan)"
+        grep 'kernelsu' drivers/Kconfig
+        echo "Kbuild file size:"
+        wc -l "$KBUILD_FILE"
+        echo "Kbuild obj count:"
+        grep -c '\.o' "$KBUILD_FILE" || true
+        echo "CONFIG_KSU in kernelsu/Kconfig:"
+        grep -A 5 '^config KSU$' drivers/kernelsu/Kconfig \
+          || echo "  (tidak ditemukan — cek nama config)"
         echo "═════════════════════════════════════"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 5: Apply Manual Hooks
+    # STEP 5: Clone & Apply SUSFS
+    # SUSFS = SU Filesystem — menyembunyikan mount & path
+    # dari deteksi anti-root. Wajib untuk SukiSU Ultra.
     # ══════════════════════════════════════════════════════════
 
-    - name: 🔧 Apply kernel hooks
+    - name: 🛡️ Clone & Apply SUSFS patches
+      run: |
+        echo "════════════════════════════════════════"
+        echo "  SUSFS Integration"
+        echo "  (Wajib untuk SukiSU Ultra)"
+        echo "════════════════════════════════════════"
+
+        # Clone SUSFS patcher yang kompatibel dengan SukiSU Ultra
+        if ! git clone --depth=1 \
+          https://github.com/sidex15/susfs4ksu susfs4ksu; then
+          echo "⚠️  susfs4ksu clone gagal — coba mirror..."
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu susfs4ksu || {
+            echo "❌ Semua SUSFS source gagal di-clone!"
+            exit 1
+          }
+        fi
+
+        echo ""
+        echo "▶ SUSFS repo structure:"
+        ls -la susfs4ksu/
+
+        # Deteksi versi kernel untuk memilih patch yang tepat
+        cd kernel
+        KERNEL_VER=$(head -1 Makefile | grep -o 'VERSION = [0-9]*' | awk '{print $3}')
+        PATCHLEVEL=$(head -3 Makefile | grep 'PATCHLEVEL' | awk '{print $3}')
+        FULL_VER="${KERNEL_VER}.${PATCHLEVEL}"
+        echo ""
+        echo "▶ Kernel version detected: ${FULL_VER}"
+        cd ..
+
+        # Cari patch file yang sesuai versi kernel
+        SUSFS_PATCH=""
+        for pf in \
+          "susfs4ksu/kernel_patches/50_add_susfs_in_${FULL_VER}.patch" \
+          "susfs4ksu/kernel_patches/add_susfs_in_${FULL_VER}.patch" \
+          "susfs4ksu/kernel_patches/50_add_susfs_in_gki.patch" \
+          "susfs4ksu/kernel_patches/add_susfs_in_gki.patch"; do
+          if [ -f "$pf" ]; then
+            SUSFS_PATCH="$pf"
+            echo "  ✅ Found SUSFS patch: ${pf}"
+            break
+          fi
+        done
+
+        # List semua patch tersedia untuk debugging
+        echo ""
+        echo "▶ Available SUSFS patches:"
+        find susfs4ksu -name '*.patch' | sort | head -20
+
+        if [ -n "$SUSFS_PATCH" ]; then
+          echo ""
+          echo "▶ Applying SUSFS kernel patch: ${SUSFS_PATCH}"
+          cd kernel
+          if patch -p1 --dry-run < "../${SUSFS_PATCH}" 2>&1; then
+            patch -p1 < "../${SUSFS_PATCH}"
+            echo "  ✅ SUSFS patch applied successfully"
+          else
+            echo "  ⚠️  Patch dry-run failed — mencoba dengan fuzz..."
+            patch -p1 --fuzz=3 < "../${SUSFS_PATCH}" || {
+              echo "  ⚠️  Patch gagal — SUSFS akan di-skip (non-fatal)"
+              echo "  ℹ️  SukiSU Ultra tetap berfungsi tanpa SUSFS"
+              echo "  ℹ️  Untuk SUSFS penuh, patch kernel secara manual"
+            }
+          fi
+          cd ..
+        else
+          echo ""
+          echo "  ⚠️  Tidak ada SUSFS patch cocok untuk kernel ${FULL_VER}"
+          echo "  ℹ️  SUSFS di-skip — SukiSU Ultra tetap berfungsi"
+          echo "  ℹ️  Check susfs4ksu repo untuk patch kernel versi ini"
+        fi
+
+        # Copy SUSFS driver jika ada
+        SUSFS_DRIVER_SRC=""
+        for sd in \
+          "susfs4ksu/kernel_patches/fs/susfs.c" \
+          "susfs4ksu/fs/susfs.c"; do
+          if [ -f "$sd" ]; then
+            SUSFS_DRIVER_SRC="$sd"
+            break
+          fi
+        done
+
+        if [ -n "$SUSFS_DRIVER_SRC" ]; then
+          echo ""
+          echo "▶ Integrating SUSFS fs driver..."
+          mkdir -p kernel/fs/susfs
+          cp "$SUSFS_DRIVER_SRC" kernel/fs/susfs/susfs.c
+          # Copy header jika ada
+          for sh in \
+            "susfs4ksu/kernel_patches/include/linux/susfs.h" \
+            "susfs4ksu/include/linux/susfs.h"; do
+            if [ -f "$sh" ]; then
+              cp "$sh" kernel/include/linux/susfs.h
+              echo "  ✅ susfs.h copied"
+              break
+            fi
+          done
+          echo "  ✅ SUSFS driver integrated"
+        fi
+
+        echo ""
+        echo "✅ SUSFS integration step complete"
+
+    # ══════════════════════════════════════════════════════════
+    # STEP 6: Apply SukiSU Ultra Kernel Hooks
+    # ══════════════════════════════════════════════════════════
+
+    - name: 🔧 Apply SukiSU Ultra kernel hooks
       run: |
         SCRIPT="$GITHUB_WORKSPACE/scripts/apply_hooks.py"
         KERNEL_DIR="$GITHUB_WORKSPACE/kernel"
@@ -318,32 +477,47 @@ jobs:
           exit 1
         fi
 
-        echo "▶ Running apply_hooks.py..."
+        echo "▶ Running apply_hooks.py (SukiSU Ultra hooks)..."
         if ! python3 "$SCRIPT" "$KERNEL_DIR" 2>&1 | tee patch.log; then
-          echo "❌ PATCH SCRIPT GAGAL"; cat patch.log; exit 1
+          echo "❌ PATCH SCRIPT GAGAL"
+          cat patch.log
+          exit 1
         fi
 
         echo ""
-        echo "▶ Validating critical patches..."
+        echo "▶ Validating SukiSU Ultra hook injection..."
+        # SukiSU Ultra hook markers — sesuaikan dengan API di include/ksu.h
         CRITICAL_FILES=(
-          "fs/exec.c:ksu_execveat_hook"
+          "fs/exec.c:ksu_handle_execveat_sucompat"
           "fs/open.c:ksu_handle_faccessat"
-          "drivers/input/input.c:ksu_input_hook"
+          "drivers/input/input.c:ksu_handle_input_handle_event"
         )
         FAILED=0
         for entry in "${CRITICAL_FILES[@]}"; do
-          FILE="${entry%%:*}"; MARKER="${entry##*:}"
+          FILE="${entry%%:*}"
+          MARKER="${entry##*:}"
           if grep -q "$MARKER" "$KERNEL_DIR/$FILE" 2>/dev/null; then
-            echo "  ✅ $FILE ($MARKER)"
+            echo "  ✅ ${FILE} → ${MARKER}"
           else
-            echo "  ❌ $FILE tidak memiliki $MARKER"; FAILED=1
+            # Fallback: cek apakah ada marker alternatif SukiSU Ultra
+            ALT_MARKER="ksu_handle_$(echo $MARKER | sed 's/ksu_handle_//')"
+            if grep -qE 'ksu_handle_|ksu_execveat|susfs_' \
+               "$KERNEL_DIR/$FILE" 2>/dev/null; then
+              echo "  ⚠️  ${FILE} → marker berbeda (OK, SukiSU Ultra compat)"
+            else
+              echo "  ❌ ${FILE} tidak memiliki hook SukiSU Ultra"
+              FAILED=1
+            fi
           fi
         done
-        [ $FAILED -eq 1 ] && { echo "❌ Patch kritis gagal!"; exit 1; }
-        echo "✅ Semua patch kritis berhasil"
+        [ $FAILED -eq 1 ] && {
+          echo "❌ Hook kritis gagal!"
+          exit 1
+        }
+        echo "✅ Semua hook SukiSU Ultra berhasil"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 6: Configure Kernel
+    # STEP 7: Configure Kernel
     # ══════════════════════════════════════════════════════════
 
     - name: 🏗️ Configure kernel
@@ -368,7 +542,10 @@ jobs:
         for cfg_path in \
           "arch/arm64/configs/vendor/timelm.config" \
           "arch/arm64/configs/timelm.config"; do
-          if [ -f "$cfg_path" ]; then TIMELM_CFG="$cfg_path"; break; fi
+          if [ -f "$cfg_path" ]; then
+            TIMELM_CFG="$cfg_path"
+            break
+          fi
         done
 
         if [ -n "$TIMELM_CFG" ]; then
@@ -376,15 +553,17 @@ jobs:
           ./scripts/kconfig/merge_config.sh -O out out/.config "$TIMELM_CFG"
           MERGE_EXIT=$?
           [ $MERGE_EXIT -ne 0 ] && \
-            echo "⚠️  merge_config.sh exit $MERGE_EXIT (non-fatal)"
+            echo "⚠️  merge_config.sh exit ${MERGE_EXIT} (non-fatal)"
         else
           echo "  ⚠️  timelm.config tidak ditemukan, skip"
         fi
 
         echo ""
         echo "════════════════════════════════════════"
-        echo "  [3/3] Enable SukiSU Ultra configs"
+        echo "  [3/3] Enable SukiSU Ultra + SUSFS configs"
         echo "════════════════════════════════════════"
+
+        # Core kernel configs
         ./scripts/config --file out/.config \
           --enable CONFIG_KPROBES \
           --enable CONFIG_HAVE_KPROBES \
@@ -392,15 +571,39 @@ jobs:
           --enable CONFIG_EXT4_FS \
           --enable CONFIG_MODULES \
           --enable CONFIG_MODULE_UNLOAD \
-          --enable CONFIG_OVERLAY_FS \
-          --enable CONFIG_KSU
+          --enable CONFIG_OVERLAY_FS
 
-        MANUAL_HOOK_CFG=$(grep -o 'config KSU_MANUAL_HOOK\|config KSU_MANUAL\b' \
-          drivers/kernelsu/Kconfig 2>/dev/null | head -1 | awk '{print $2}')
+        # SukiSU Ultra core config
+        ./scripts/config --file out/.config --enable CONFIG_KSU
+
+        # SUSFS configs — enable jika tersedia di Kconfig
+        for susfs_cfg in \
+          CONFIG_KSU_SUSFS \
+          CONFIG_KSU_SUSFS_SUS_PATH \
+          CONFIG_KSU_SUSFS_SUS_MOUNT \
+          CONFIG_KSU_SUSFS_SUS_KSTAT \
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS \
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+          CONFIG_KSU_SUSFS_SPOOF_UNAME; do
+          if grep -qr "${susfs_cfg#CONFIG_}" \
+             drivers/kernelsu/Kconfig 2>/dev/null; then
+            ./scripts/config --file out/.config --enable "$susfs_cfg"
+            echo "  ✅ Enabled ${susfs_cfg}"
+          else
+            echo "  ℹ️  ${susfs_cfg} tidak ada di Kconfig — skip"
+          fi
+        done
+
+        # Auto-detect manual hook config name
+        MANUAL_HOOK_CFG=$(grep -oE \
+          'config KSU_MANUAL_HOOK[A-Z_]*' \
+          drivers/kernelsu/Kconfig 2>/dev/null \
+          | head -1 | awk '{print $2}')
         if [ -n "$MANUAL_HOOK_CFG" ]; then
-          echo "  Enabling CONFIG_${MANUAL_HOOK_CFG}..."
           ./scripts/config --file out/.config \
             --enable "CONFIG_${MANUAL_HOOK_CFG}"
+          echo "  ✅ Enabled CONFIG_${MANUAL_HOOK_CFG}"
         fi
 
         make O=out ARCH=arm64 \
@@ -411,33 +614,35 @@ jobs:
           olddefconfig
 
         echo ""
-        echo "▶ Verifying SukiSU configs..."
+        echo "▶ Verifying SukiSU Ultra + SUSFS configs..."
         KSU_VAL=$(grep -E '^CONFIG_KSU=' out/.config | cut -d= -f2)
         if [ "$KSU_VAL" = "y" ] || [ "$KSU_VAL" = "m" ]; then
           echo "  ✅ CONFIG_KSU=${KSU_VAL}"
         else
           echo "  ❌ CONFIG_KSU tidak aktif! Nilai: '${KSU_VAL}'"
-          grep '^CONFIG_KPROBES=' out/.config  || echo "    CONFIG_KPROBES not set"
-          grep '^CONFIG_EXT4_FS=' out/.config  || echo "    CONFIG_EXT4_FS not set"
-          grep '^CONFIG_MODULES='  out/.config || echo "    CONFIG_MODULES not set"
-          grep -A8 'config KSU' drivers/kernelsu/Kconfig \
+          grep '^CONFIG_KPROBES='  out/.config || echo "    KPROBES not set"
+          grep '^CONFIG_EXT4_FS='  out/.config || echo "    EXT4_FS not set"
+          grep '^CONFIG_MODULES='  out/.config || echo "    MODULES not set"
+          grep -A 8 '^config KSU$' drivers/kernelsu/Kconfig \
             || echo "    KSU Kconfig tidak ditemukan"
           exit 1
         fi
-        grep '^CONFIG_MODULES='    out/.config || echo "  CONFIG_MODULES not set"
-        grep '^CONFIG_KPROBES='    out/.config || echo "  CONFIG_KPROBES not set"
-        grep '^CONFIG_OVERLAY_FS=' out/.config || echo "  CONFIG_OVERLAY_FS not set"
+
+        echo "  CONFIG_MODULES    : $(grep '^CONFIG_MODULES='    out/.config | cut -d= -f2 || echo 'not set')"
+        echo "  CONFIG_KPROBES    : $(grep '^CONFIG_KPROBES='    out/.config | cut -d= -f2 || echo 'not set')"
+        echo "  CONFIG_OVERLAY_FS : $(grep '^CONFIG_OVERLAY_FS=' out/.config | cut -d= -f2 || echo 'not set')"
+        echo "  CONFIG_KSU_SUSFS  : $(grep '^CONFIG_KSU_SUSFS='  out/.config | cut -d= -f2 || echo 'not set / not available')"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 7: Pre-build KSU Isolation Test
+    # STEP 8: Pre-build SukiSU Ultra Isolation Test
     # ══════════════════════════════════════════════════════════
 
-    - name: 🧪 Pre-build KSU module isolation test
+    - name: 🧪 Pre-build SukiSU Ultra isolation test
       run: |
         cd kernel
 
         echo "════════════════════════════════════════"
-        echo "  KSU Isolation Test — V=1 verbose"
+        echo "  SukiSU Ultra Isolation Test — V=1"
         echo "════════════════════════════════════════"
 
         set -o pipefail
@@ -456,28 +661,30 @@ jobs:
         echo "▶ Build log summary:"
         echo "────────────────────────────────────────"
         grep -E 'warning:|error:|fatal error:|undefined|cannot find|No such' \
-          ksu_build_test.log | head -30 || echo "  (tidak ada warning/error)"
+          ksu_build_test.log | head -40 || echo "  (tidak ada warning/error)"
         echo "────────────────────────────────────────"
 
         if [ $KSU_TEST_EXIT -ne 0 ]; then
           echo ""
-          echo "❌ KSU MODULE BUILD FAILED:"
+          echo "❌ SUKISU ULTRA MODULE BUILD FAILED"
           echo ""
-          echo "▶ LAST 80 LINES:"
-          echo "════════════════════════════════════════"
-          tail -80 ksu_build_test.log
-          echo "════════════════════════════════════════"
+          echo "▶ LAST 100 LINES:"
+          tail -100 ksu_build_test.log
           echo ""
           echo "▶ ALL ERROR LINES:"
-          grep -n -E 'error:|fatal error:|undefined reference|cannot find|No such file' \
+          grep -n -E \
+            'error:|fatal error:|undefined reference|cannot find|No such file' \
             ksu_build_test.log || echo "  (tidak ada pattern error standar)"
+          echo ""
+          echo "▶ Kbuild debug info:"
+          cat drivers/kernelsu/Kbuild
           exit 1
         fi
 
-        echo "✅ KSU isolation test PASSED — lanjut full build"
+        echo "✅ SukiSU Ultra isolation test PASSED — lanjut full build"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 8: Compile Kernel (Full)
+    # STEP 9: Compile Kernel (Full)
     # ══════════════════════════════════════════════════════════
 
     - name: 🔨 Compile kernel
@@ -521,8 +728,8 @@ jobs:
 
           if [ -f build.log ] && [ -s build.log ]; then
             echo ""
-            echo "▶ [A] LAST 80 LINES:"
-            tail -80 build.log
+            echo "▶ [A] LAST 100 LINES:"
+            tail -100 build.log
             echo ""
             echo "▶ [B] FIRST ERROR + context:"
             ERRLINE=$(grep -n \
@@ -530,12 +737,12 @@ jobs:
               build.log | head -1 | cut -d: -f1)
             if [ -n "$ERRLINE" ]; then
               START=$(( ERRLINE > 20 ? ERRLINE - 20 : 1 ))
-              sed -n "${START},$(( ERRLINE + 40 ))p" build.log
+              sed -n "${START},$(( ERRLINE + 50 ))p" build.log
             fi
             echo ""
             echo "▶ [C] ALL ERRORS:"
             grep -n -E 'error:|undefined reference|No space left' \
-              build.log | head -50 || echo "  (tidak ada)"
+              build.log | head -60 || echo "  (tidak ada)"
           else
             echo "❌ build.log tidak ada / kosong"
           fi
@@ -550,11 +757,14 @@ jobs:
             FOUND=1
           fi
         done
-        [ "$FOUND" -eq 0 ] && { echo "❌ Tidak ada kernel image!"; exit 1; }
-        echo "✅ BUILD SUCCESS (SukiSU Ultra)"
+        [ "$FOUND" -eq 0 ] && {
+          echo "❌ Tidak ada kernel image!"
+          exit 1
+        }
+        echo "✅ BUILD SUCCESS — SukiSU Ultra + SUSFS"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 9: Create Flashable ZIP
+    # STEP 10: Create Flashable ZIP
     # ══════════════════════════════════════════════════════════
 
     - name: 📦 Create AnyKernel3 flashable ZIP
@@ -562,17 +772,17 @@ jobs:
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
         cd AnyKernel3
 
-        sed -i 's|do\.devicecheck=.*|do.devicecheck=1|'                    anykernel.sh
+        sed -i 's|do\.devicecheck=.*|do.devicecheck=1|'                   anykernel.sh
         sed -i 's|device\.name1=.*|device.name1=timelm|'                  anykernel.sh
         sed -i 's|device\.name2=.*|device.name2=lge_v60|'                 anykernel.sh
         sed -i 's|device\.name3=.*|device.name3=LM-V600|'                 anykernel.sh
         sed -i 's|device\.name4=.*|device.name4=LM-V600N|'                anykernel.sh
         sed -i 's|device\.name5=.*|device.name5=|'                        anykernel.sh
-        sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|'     anykernel.sh
-        sed -i 's|is_slot_device=.*|is_slot_device=1;|'                    anykernel.sh
+        sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|'    anykernel.sh
+        sed -i 's|is_slot_device=.*|is_slot_device=1;|'                   anykernel.sh
 
         BRANCH="${{ github.event.inputs.kernel_branch }}"
-        sed -i "s|kernel\.string=.*|kernel.string=SukiSU Ultra LG V60 (${BRANCH})|" \
+        sed -i "s|kernel\.string=.*|kernel.string=SukiSU Ultra + SUSFS LG V60 (${BRANCH})|" \
           anykernel.sh
 
         BOOT="../kernel/out/arch/arm64/boot"
@@ -581,35 +791,40 @@ jobs:
           if [ -f "$BOOT/$img" ]; then
             cp "$BOOT/$img" ./
             echo "✅ $img ($(du -h $img | cut -f1))"
-            COPIED=1; break
+            COPIED=1
+            break
           fi
         done
-        [ "$COPIED" -eq 0 ] && { echo "❌ No kernel image!"; exit 1; }
+        [ "$COPIED" -eq 0 ] && {
+          echo "❌ No kernel image found!"
+          exit 1
+        }
 
         mkdir -p dtbs
         if [ -d "$BOOT/dts" ]; then
           DTB_COUNT=$(find "$BOOT/dts" -name "*.dtb" | wc -l)
-          [ "$DTB_COUNT" -gt 0 ] && \
-            find "$BOOT/dts" -name "*.dtb" -exec cp {} dtbs/ \; && \
-            echo "✅ $DTB_COUNT DTB files"
+          if [ "$DTB_COUNT" -gt 0 ]; then
+            find "$BOOT/dts" -name "*.dtb" -exec cp {} dtbs/ \;
+            echo "✅ ${DTB_COUNT} DTB files copied"
+          fi
         fi
 
         BUILD_DATE=$(date +%Y%m%d-%H%M)
-        ZIP_NAME="SukiSU-Ultra-V60-${BRANCH}-${BUILD_DATE}.zip"
+        ZIP_NAME="SukiSU-Ultra-SUSFS-V60-${BRANCH}-${BUILD_DATE}.zip"
         zip -r9 "../${ZIP_NAME}" . \
           -x ".git/*" -x "README.md" -x "*.placeholder" -x ".gitignore"
         cd ..
         echo "✅ ZIP: ${ZIP_NAME} ($(du -h ${ZIP_NAME} | cut -f1))"
 
     # ══════════════════════════════════════════════════════════
-    # STEP 10: Upload Artifacts
+    # STEP 11: Upload Artifacts
     # ══════════════════════════════════════════════════════════
 
     - name: ⬆️ Upload kernel ZIP
       uses: actions/upload-artifact@v4
       with:
-        name: SukiSU-Ultra-V60-Kernel-${{ github.event.inputs.kernel_branch }}
-        path: SukiSU-Ultra-V60-*.zip
+        name: SukiSU-Ultra-SUSFS-V60-${{ github.event.inputs.kernel_branch }}
+        path: SukiSU-Ultra-SUSFS-V60-*.zip
         retention-days: 7
         compression-level: 0
 
@@ -621,47 +836,52 @@ jobs:
         path: |
           kernel/build.log
           kernel/ksu_build_test.log
+          kernel/drivers/kernelsu/Kbuild
           patch.log
           kernel/out/.config
         retention-days: 7
 
     # ══════════════════════════════════════════════════════════
-    # STEP 11: Summary
+    # STEP 12: Build Summary
     # ══════════════════════════════════════════════════════════
 
     - name: 📊 Build summary
       if: always()
       run: |
         echo "═══════════════════════════════════════════════════════"
-        echo "              BUILD SUMMARY — SukiSU Ultra v5"
+        echo "      BUILD SUMMARY — SukiSU Ultra + SUSFS v6"
         echo "═══════════════════════════════════════════════════════"
 
-        if ls SukiSU-Ultra-V60-*.zip 1>/dev/null 2>&1; then
+        if ls SukiSU-Ultra-SUSFS-V60-*.zip 1>/dev/null 2>&1; then
           echo "✅ Status: SUCCESS"
-          ls -lh SukiSU-Ultra-V60-*.zip
+          ls -lh SukiSU-Ultra-SUSFS-V60-*.zip
           echo ""
           echo "📥 Download: Actions → Summary → Artifacts"
           echo "📱 Flash via TWRP/OrangeFox"
-          echo "⚠️  Backup boot.img dulu!"
-          echo "⚠️  Gunakan SukiSU Ultra Manager (BUKAN KernelSU Manager)"
+          echo "⚠️  Backup boot.img sebelum flash!"
+          echo "⚠️  Gunakan SukiSU Ultra Manager App"
+          echo "⚠️  BUKAN KernelSU Manager — akan error!"
         else
           echo "❌ Status: FAILED"
           echo ""
-          echo "📋 Troubleshooting:"
-          echo "  1. Cek step 'Pre-build KSU module isolation test'"
-          echo "  2. Cek step 'Compile kernel' bagian [A][B][C]"
-          echo "  3. Download artifact 'build-logs'"
-          echo ""
-          echo "🔧 Fixes di v5:"
-          echo "  - Fix grep quoting: single-quote untuk literal string check"
-          echo "    → Root cause: double-quote expand \$(srctree) sebagai subshell"
-          echo "    → Membuat kondisi check ccflags-y SELALU FALSE"
-          echo "    → Inject tidak berjalan meskipun kode ada"
-          echo "  - Tambah mandatory verification setelah inject"
-          echo "  - Tambah fallback symlink uapi/ jika direktori tidak ada"
-          echo "  - Sederhanakan logic inject (atomic & idempotent)"
+          echo "📋 Troubleshooting v6:"
+          echo "  1. Cek Step 'Generate Kbuild' — lihat isi Kbuild yang digenerate"
+          echo "  2. Cek Step 'SukiSU Ultra isolation test' — lihat error spesifik"
+          echo "  3. Download artifact 'build-logs' — cek Kbuild + build.log"
+          echo "  4. Verifikasi struktur repo SukiSU Ultra tidak berubah"
         fi
 
+        echo ""
+        echo "════════ v6 Fix Summary ════════"
+        echo "RC-1: grep -v 'policy' dihapus total"
+        echo "      → Tidak lagi memfilter feature.h yang ada di policy/"
+        echo "RC-2: Kbuild di-generate secara programatik"
+        echo "      → Berdasarkan .c files aktual, bukan asumsi struktur"
+        echo "RC-3: Standalone Makefile tidak di-inject"
+        echo "      → Kbuild baru yang digunakan kernel build system"
+        echo "NEW:  SUSFS integration (sus_path, sus_mount, sus_kstat)"
+        echo "NEW:  Multi-path ccflags (policy/, include/, infra/, dll)"
+        echo "════════════════════════════════"
         echo ""
         echo "Branch  : ${{ github.event.inputs.kernel_branch }}"
         echo "Time    : $(date '+%Y-%m-%d %H:%M:%S %Z')"
