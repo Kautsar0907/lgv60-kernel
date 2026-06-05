@@ -14,7 +14,7 @@ on:
           - lineage-22.2
 
 # ══════════════════════════════════════════════════════════════
-# Job-level env: definisikan sekali, tersedia di semua steps
+# Job-level env
 # ══════════════════════════════════════════════════════════════
 env:
   ARCH: arm64
@@ -107,6 +107,16 @@ jobs:
 
     # ══════════════════════════════════════════════════════════
     # STEP 3: Inject SukiSU Ultra (Manual Method)
+    #
+    # FIX #2: Ganti relative symlink → absolute symlink
+    #   Sebelum: ln -sf ../SukiSU/kernel kernelsu
+    #   Sesudah: ln -sf "$(realpath ../SukiSU/kernel)" kernelsu
+    #
+    # Alasan: relative symlink "../SukiSU/kernel" di-resolve relatif
+    # terhadap direktori TEMPAT symlink berada (drivers/).
+    # Dalam konteks out-of-tree build (make O=out), beberapa versi
+    # Kbuild/Android kernel fork mis-resolve relative symlink saat
+    # membaca Makefile dari build tree. Absolute path eliminasi ambiguitas ini.
     # ══════════════════════════════════════════════════════════
 
     - name: 💉 Clone SukiSU Ultra source
@@ -117,13 +127,17 @@ jobs:
         if ! git clone --depth=1 \
           https://github.com/SukiSU-Ultra/SukiSU-Ultra SukiSU; then
           echo "❌ Gagal clone SukiSU Ultra repository!"
-          echo "   URL: https://github.com/SukiSU-Ultra/SukiSU-Ultra"
           exit 1
         fi
 
-        echo "▶ Creating symlink (relative path)..."
+        echo "▶ Creating symlink (FIX #2: absolute path)..."
         cd drivers
-        ln -sf ../SukiSU/kernel kernelsu
+
+        # FIX #2: Gunakan absolute path untuk symlink agar tidak
+        # ada ambiguitas saat Kbuild resolve path dalam out-of-tree build.
+        SUKISU_ABS="$(realpath ../SukiSU/kernel)"
+        echo "  SukiSU absolute path: $SUKISU_ABS"
+        ln -sf "$SUKISU_ABS" kernelsu
         cd ..
 
         # Verifikasi symlink
@@ -141,7 +155,12 @@ jobs:
         fi
 
         echo "✅ Symlink: drivers/kernelsu -> $(readlink drivers/kernelsu)"
-        ls -la drivers/kernelsu
+        ls -la drivers/kernelsu/
+
+        # Tampilkan struktur SukiSU untuk verifikasi
+        echo ""
+        echo "▶ SukiSU kernel/ structure:"
+        ls drivers/kernelsu/ | head -20
 
     - name: 🔧 Integrate SukiSU into build system
       run: |
@@ -232,16 +251,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════
     # STEP 5: Configure Kernel
-    #
-    # FIX #1 (ROOT CAUSE): merge_config.sh dipanggil dengan cara
-    #   yang benar: eksekusi dari kernel root dir, gunakan flag -O
-    #   untuk mengarahkan output ke out/, dan pass ARCH + compiler
-    #   vars agar scripts/as-version.sh bisa menemukan assembler.
-    #
-    # FIX #2 (ROOT CAUSE): Tambahkan --enable CONFIG_KPROBES dan
-    #   CONFIG_EXT4_FS sebelum olddefconfig. CONFIG_KSU punya
-    #   `depends on KPROBES && EXT4_FS` — tanpa ini, Kconfig resolver
-    #   PASTI mematikan CONFIG_KSU secara otomatis saat olddefconfig.
     # ══════════════════════════════════════════════════════════
 
     - name: 🏗️ Configure kernel
@@ -276,13 +285,6 @@ jobs:
 
         if [ -n "$TIMELM_CFG" ]; then
           echo "  Using: $TIMELM_CFG"
-
-          # FIX #1: Gunakan flag -O untuk redirect output ke out/.config
-          # dan eksekusi dari kernel root (CWD sudah benar: `cd kernel` di atas).
-          # Flag -O memastikan merge_config.sh memanggil:
-          #   make O=out alldefconfig
-          # bukan bare `make alldefconfig`, sehingga path scripts/ diresolve
-          # relatif terhadap kernel root, bukan direktori out/.
           ./scripts/kconfig/merge_config.sh \
             -O out \
             out/.config \
@@ -290,13 +292,10 @@ jobs:
 
           MERGE_EXIT=$?
           if [ $MERGE_EXIT -ne 0 ]; then
-            echo "⚠️  merge_config.sh returned exit $MERGE_EXIT"
-            echo "   (Warning tentang 'Value not in final .config' adalah normal"
-            echo "    jika config tersebut punya unmet dependency — bukan fatal error)"
+            echo "⚠️  merge_config.sh returned exit $MERGE_EXIT (non-fatal warning)"
           fi
         else
           echo "  ⚠️  timelm.config tidak ditemukan, skip merge"
-          echo "     Build akan tetap jalan dengan kona-perf_defconfig"
         fi
 
         echo ""
@@ -304,18 +303,9 @@ jobs:
         echo "  [3/3] Enable SukiSU Ultra configs"
         echo "════════════════════════════════════════"
 
-        # FIX #2: Enable SEMUA dependency CONFIG_KSU terlebih dahulu.
-        #
-        # Urutan WAJIB:
-        #   1. KPROBES       ← dependency langsung CONFIG_KSU
-        #   2. EXT4_FS       ← dependency langsung CONFIG_KSU
-        #   3. OVERLAY_FS    ← dibutuhkan untuk mount namespace overlay
-        #   4. MODULES       ← agar KSU bisa dicompile sebagai module (tristate)
-        #   5. CONFIG_KSU    ← baru aktifkan setelah semua dep terpenuhi
-        #
-        # Jika urutan ini tidak diikuti, `make olddefconfig` akan
-        # mematikan CONFIG_KSU secara silent karena dep tidak terpenuhi.
-
+        # FIX #5: Cek apakah KPROBES tersedia di arch ini.
+        # Kona (SM8250) mendukung kprobes, tapi beberapa vendor defconfig
+        # mematikannya. Aktifkan dulu, lalu cek hasilnya setelah olddefconfig.
         ./scripts/config --file out/.config \
           --enable CONFIG_KPROBES \
           --enable CONFIG_HAVE_KPROBES \
@@ -326,10 +316,12 @@ jobs:
           --enable CONFIG_OVERLAY_FS \
           --enable CONFIG_KSU
 
-        # FIX: Jalankan olddefconfig SETELAH semua --enable di atas,
-        # bukan sebelumnya. olddefconfig hanya mengisi missing configs
-        # dengan default — ia akan memvalidasi dependency dan mematikan
-        # option yang depnya tidak terpenuhi.
+        # FIX #5: Set CONFIG_KSU_MANUAL_HOOK=y sebagai fallback
+        # jika kernel tidak support kprobes secara penuh.
+        # SukiSU Ultra mendukung mode manual hook tanpa kprobe.
+        ./scripts/config --file out/.config \
+          --enable CONFIG_KSU_MANUAL_HOOK 2>/dev/null || true
+
         make O=out ARCH=arm64 \
           CC=clang \
           CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -340,7 +332,6 @@ jobs:
         echo ""
         echo "▶ Verifying SukiSU Ultra configs..."
 
-        # Cek CONFIG_KSU — bisa =y (built-in) atau =m (module), keduanya valid
         KSU_VAL=$(grep -E '^CONFIG_KSU=' out/.config | cut -d= -f2)
         if [ "$KSU_VAL" = "y" ] || [ "$KSU_VAL" = "m" ]; then
           echo "  ✅ CONFIG_KSU=${KSU_VAL} (SukiSU Ultra AKTIF)"
@@ -348,40 +339,109 @@ jobs:
           echo "  ❌ CONFIG_KSU tidak aktif! (nilai: '${KSU_VAL}')"
           echo ""
           echo "══ Debugging info ══"
-          echo ""
-          echo "1. Kconfig integration check:"
+          echo "1. Kconfig integration:"
           grep 'kernelsu' drivers/Kconfig || echo "   TIDAK ADA di drivers/Kconfig!"
-          echo ""
           echo "2. SukiSU Kconfig file:"
           ls -la drivers/kernelsu/Kconfig || echo "   FILE TIDAK ADA!"
-          echo ""
-          echo "3. CONFIG_KSU dependency check:"
+          echo "3. CONFIG_KSU dependency:"
           grep -A5 'config KSU' drivers/kernelsu/Kconfig || echo "   TIDAK BISA DIBACA!"
-          echo ""
-          echo "4. Dependency fulfillment check:"
+          echo "4. Dependency check:"
           echo "   CONFIG_KPROBES    = $(grep '^CONFIG_KPROBES=' out/.config || echo 'NOT SET')"
           echo "   CONFIG_EXT4_FS    = $(grep '^CONFIG_EXT4_FS=' out/.config || echo 'NOT SET')"
           echo "   CONFIG_MODULES    = $(grep '^CONFIG_MODULES=' out/.config || echo 'NOT SET')"
-          echo ""
-          echo "5. Current .config KSU-related lines:"
-          grep -i 'ksu\|kernelsu\|sukisu\|kprobes' out/.config || echo "   TIDAK ADA MENTION!"
+          echo "5. KSU-related lines in .config:"
+          grep -i 'ksu\|kernelsu\|sukisu\|kprobes' out/.config || echo "   TIDAK ADA!"
           exit 1
         fi
 
         echo ""
         echo "Other important configs:"
-        grep '^CONFIG_MODULES='    out/.config || echo "  CONFIG_MODULES not set"
-        grep '^CONFIG_KPROBES='    out/.config || echo "  CONFIG_KPROBES not set"
-        grep '^CONFIG_EXT4_FS='    out/.config || echo "  CONFIG_EXT4_FS not set"
-        grep '^CONFIG_OVERLAY_FS=' out/.config || echo "  CONFIG_OVERLAY_FS not set"
+        grep '^CONFIG_MODULES='       out/.config || echo "  CONFIG_MODULES not set"
+        grep '^CONFIG_KPROBES='       out/.config || echo "  CONFIG_KPROBES not set"
+        grep '^CONFIG_EXT4_FS='       out/.config || echo "  CONFIG_EXT4_FS not set"
+        grep '^CONFIG_OVERLAY_FS='    out/.config || echo "  CONFIG_OVERLAY_FS not set"
+        grep '^CONFIG_KSU_MANUAL'     out/.config || echo "  CONFIG_KSU_MANUAL_HOOK not set (OK jika kprobes aktif)"
+
+    # ══════════════════════════════════════════════════════════
+    # STEP 5b: Pre-build KSU module isolation test
+    #
+    # FIX #3 (BARU): Kompilasi drivers/kernelsu/ secara terpisah
+    # SEBELUM full kernel build. Jika ada error di SukiSU (undefined
+    # symbol, header tidak ditemukan, dll), error langsung terisolasi
+    # di step ini — bukan tenggelam di tengah full build log 50k baris.
+    #
+    # Jika step ini PASS → lanjut full build dengan confidence tinggi.
+    # Jika step ini FAIL → baca error di sini langsung, tidak perlu
+    #   analisis build.log yang panjang.
+    # ══════════════════════════════════════════════════════════
+
+    - name: 🧪 Pre-build KSU module isolation test
+      run: |
+        cd kernel
+
+        echo "════════════════════════════════════════"
+        echo "  FIX #3: KSU Module Isolation Test"
+        echo "  Tujuan: isolasi error SukiSU sebelum full build"
+        echo "════════════════════════════════════════"
+        echo ""
+
+        # Compile HANYA drivers/kernelsu/ — bukan seluruh kernel.
+        # Ini jauh lebih cepat (< 60 detik) dan langsung menampilkan
+        # error jika ada masalah di SukiSU source.
+        #
+        # Note: Ini BUKAN module build (M=), ini subdir build.
+        # Kbuild akan compile semua .c di drivers/kernelsu/ dan
+        # link menjadi drivers/kernelsu/built-in.a
+        set -o pipefail
+        make O=out ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+          -j$(nproc) \
+          drivers/kernelsu/ 2>&1 | tee ksu_build_test.log
+
+        KSU_TEST_EXIT=${PIPESTATUS[0]}
+
+        if [ $KSU_TEST_EXIT -ne 0 ]; then
+          echo ""
+          echo "╔═══════════════════════════════════════════╗"
+          echo "║  ❌ KSU MODULE BUILD FAILED               ║"
+          echo "║     Root cause terisolasi di step ini!    ║"
+          echo "╚═══════════════════════════════════════════╝"
+          echo ""
+          echo "▶ Full error output:"
+          echo "────────────────────────────────────────────"
+          # FIX #1: Langsung print log ke stdout sebelum exit
+          # Tidak ada truncation karena ini eksplisit cat, bukan streaming
+          cat ksu_build_test.log
+          echo "────────────────────────────────────────────"
+          echo ""
+          echo "▶ Error lines only:"
+          grep -n -E 'error:|undefined reference|cannot find|No such file' ksu_build_test.log || echo "  (tidak ada pattern error standar — lihat full log di atas)"
+          exit 1
+        fi
+
+        echo ""
+        echo "✅ KSU module isolation test PASSED!"
+        echo "   drivers/kernelsu/ berhasil dikompilasi"
+        echo "   Lanjut ke full kernel build..."
 
     # ══════════════════════════════════════════════════════════
     # STEP 6: Build Kernel
     #
-    # FIX: Pisahkan PIPESTATUS capture dari `|| true` pattern.
-    # Dengan `set -euo pipefail`, konstruk `cmd | tee ... || true`
-    # menyebabkan PIPESTATUS[0] selalu jadi 0 atau tidak terdefinisi
-    # karena `|| true` menelan exit code pipe sebelumnya.
+    # FIX #1 (KRITIS): Ekspos isi build.log ke stdout SEBELUM exit 1.
+    # Masalah sebelumnya: error asli ada di build.log tapi tidak
+    # ditampilkan ke GitHub Actions log karena output streaming
+    # terpotong saat job gagal.
+    #
+    # Solusi: setelah BUILD_EXIT != 0, jalankan:
+    #   1. grep untuk baris error pertama
+    #   2. tampilkan konteks ±30 baris dari error tersebut
+    #   3. tampilkan 60 baris terakhir log (untuk linker error yang
+    #      biasanya muncul di akhir)
+    # Semua ini SEBELUM exit 1 — sehingga GitHub Actions sempat
+    # menangkap dan menampilkan output ini.
     # ══════════════════════════════════════════════════════════
 
     - name: 🔨 Compile kernel
@@ -400,10 +460,6 @@ jobs:
         echo "════════════════════════════════════════"
         echo ""
 
-        # FIX: Jangan gunakan set -e di sini agar kita bisa capture
-        # exit code secara eksplisit dan berikan diagnostik yang baik.
-        # Pisahkan make dan tee: jalankan make dulu, simpan exitcode,
-        # lalu tee hanya untuk logging (exit code make tidak terpengaruh tee).
         set -o pipefail
 
         timeout 90m make O=out ARCH=arm64 \
@@ -414,8 +470,8 @@ jobs:
           -j$(nproc) \
           2>&1 | tee build.log
 
-        # Dengan set -o pipefail, jika make gagal, exit code pipe adalah
-        # exit code make (bukan tee). Simpan sebelum hilang.
+        # PENTING: Capture PIPESTATUS[0] SEGERA setelah pipeline,
+        # sebelum command apapun (termasuk echo) me-reset $?.
         BUILD_EXIT=${PIPESTATUS[0]}
 
         BUILD_END=$(date +%s)
@@ -437,39 +493,58 @@ jobs:
           echo "╚════════════════════════════════════╝"
           echo ""
 
+          # ── Disk space check ──────────────────────────────────
           AVAIL_KB=$(df / | tail -1 | awk '{print $4}')
           AVAIL_MB=$(( AVAIL_KB / 1024 ))
-
           if [ "$AVAIL_MB" -lt 500 ]; then
             echo "🚨 DISK SPACE KRITIS: ${AVAIL_MB}MB tersisa"
             echo "   Build mungkin gagal karena disk penuh"
             echo ""
           fi
 
+          # ── FIX #1: Ekspos error ke stdout sebelum exit ────────
           if [ -f build.log ] && [ -s build.log ]; then
-            echo "▶ First error in build.log:"
-            echo "─────────────────────────────────────"
+
+            # ── Bagian A: Linker errors (paling sering muncul di akhir) ──
+            echo "▶ [A] LINKER ERRORS (last 80 lines of build.log):"
+            echo "══════════════════════════════════════════════════"
+            tail -80 build.log
+            echo ""
+
+            # ── Bagian B: First compiler error dengan context ──────
+            echo "▶ [B] FIRST COMPILER ERROR + context:"
+            echo "══════════════════════════════════════════════════"
 
             ERRLINE=$(grep -n \
-              -E '^[^:]+\.(c|h|S):[0-9]+:[0-9]+: error:|make\[[0-9]+\]: \*\*\*|No space left|ld\.lld: error' \
+              -E '^[^:]+\.(c|h|S):[0-9]+:[0-9]+: error:|make\[[0-9]+\]: \*\*\*|No space left|ld\.lld: error:|undefined reference' \
               build.log | head -1 | cut -d: -f1)
 
             if [ -n "$ERRLINE" ]; then
-              START=$(( ERRLINE > 15 ? ERRLINE - 15 : 1 ))
-              END=$(( ERRLINE + 30 ))
+              echo "  → First error at line $ERRLINE of build.log"
+              echo ""
+              START=$(( ERRLINE > 20 ? ERRLINE - 20 : 1 ))
+              END=$(( ERRLINE + 40 ))
               sed -n "${START},${END}p" build.log
             else
-              echo "No explicit error found in log"
-              echo "Showing last 50 lines:"
-              tail -50 build.log
+              echo "  (Tidak ada pola error standar ditemukan di build.log)"
             fi
+
+            echo ""
+
+            # ── Bagian C: Semua baris error (tanpa context, untuk overview) ──
+            echo "▶ [C] ALL ERROR LINES (overview):"
+            echo "══════════════════════════════════════════════════"
+            grep -n -E 'error:|undefined reference|cannot find|No space left' build.log | head -50 || echo "  (tidak ada baris error)"
+
           else
             echo "❌ build.log tidak ada atau kosong!"
+            echo "   Kemungkinan timeout terjadi sebelum make dimulai."
           fi
 
           exit 1
         fi
 
+        # ── Verifikasi output ──────────────────────────────────
         IMAGES_FOUND=0
         echo "▶ Checking build artifacts:"
         for img in Image.gz-dtb Image.gz Image; do
@@ -504,7 +579,6 @@ jobs:
         cd AnyKernel3
 
         echo "▶ Configuring for LG V60 ThinQ (timelm)..."
-
         sed -i 's|do\.devicecheck=.*|do.devicecheck=1|' anykernel.sh
         sed -i 's|device\.name1=.*|device.name1=timelm|' anykernel.sh
         sed -i 's|device\.name2=.*|device.name2=lge_v60|' anykernel.sh
@@ -570,9 +644,6 @@ jobs:
         echo "╚════════════════════════════════════╝"
         echo "File: ${ZIP_NAME}"
         echo "Size: ${ZIP_SIZE}"
-        echo ""
-        echo "▶ ZIP contents:"
-        unzip -l "${ZIP_NAME}" | grep -E 'Image|\.dtb|anykernel\.sh'
 
     # ══════════════════════════════════════════════════════════
     # STEP 8: Upload Artifacts
@@ -593,6 +664,7 @@ jobs:
         name: build-logs-${{ github.event.inputs.kernel_branch }}
         path: |
           kernel/build.log
+          kernel/ksu_build_test.log
           patch.log
           kernel/out/.config
         retention-days: 7
@@ -626,35 +698,32 @@ jobs:
           echo "   2. Install → Pilih file ZIP yang sudah didownload"
           echo "   3. Swipe to confirm flash"
           echo "   4. Reboot system"
-          echo ""
           echo "   5. Install SukiSU Ultra Manager APK:"
           echo "      https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases"
           echo ""
           echo "⚠️  IMPORTANT:"
           echo "   - Pastikan backup boot.img sebelum flash!"
-          echo "   - Jika bootloop, restore boot.img dari recovery"
-          echo "   - Safe mode: Tahan VOL- saat booting untuk disable root"
           echo "   - JANGAN gunakan KernelSU Manager — gunakan SukiSU Ultra Manager"
         else
           echo "❌ Status: FAILED"
           echo ""
-          echo "📋 Troubleshooting:"
-          echo "   1. Download 'build-logs' dari Artifacts (berisi build.log, patch.log, .config)"
-          echo "   2. Cari baris yang mengandung 'error:' di build.log"
-          echo "   3. Cek patch.log untuk proses patching SukiSU Ultra"
+          echo "📋 Troubleshooting Priority:"
+          echo "   1. Cek log step 'Pre-build KSU module isolation test'"
+          echo "      → Jika FAIL di sini, error ada di SukiSU source/hooks"
+          echo "   2. Cek log step 'Compile kernel'"
+          echo "      → Bagian [A] Last 80 lines, [B] First error, [C] All errors"
+          echo "   3. Download artifact 'build-logs' → buka build.log"
           echo ""
-          echo "🔧 Common Issues:"
-          echo "   - Disk full: Hapus cache atau pilih runner dengan lebih banyak space"
-          echo "   - Config error: Cek apakah timelm.config kompatibel dengan branch"
-          echo "   - Patch error: Cek apakah kernel version cocok dengan SukiSU Ultra"
-          echo "   - Symlink error: Pastikan SukiSU Ultra repo berhasil di-clone"
-          echo ""
-          echo "💬 Need help? Open an issue di repository ini"
+          echo "🔧 Common Fixes:"
+          echo "   - Undefined reference: hooks di fs/exec.c atau fs/open.c salah patch"
+          echo "   - Kprobe error: CONFIG_KSU_MANUAL_HOOK=y sudah di-enable sebagai fallback"
+          echo "   - Symlink error: FIX #2 sudah pakai absolute path"
+          echo "   - Disk full: Hapus cache atau pilih runner dengan lebih space"
         fi
 
         echo ""
         echo "════════════════════════════════════════════════════════"
-        echo "Branch:   ${{ github.event.inputs.kernel_branch }}"
+        echo "Branch:    ${{ github.event.inputs.kernel_branch }}"
         echo "Build time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-        echo "Run URL:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        echo "Run URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         echo "════════════════════════════════════════════════════════"
