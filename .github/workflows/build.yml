@@ -28,7 +28,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120   # FIX: Cegah hang tak terbatas, hemat CI quota
+    timeout-minutes: 120
 
     steps:
 
@@ -107,8 +107,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════
     # STEP 3: Inject SukiSU Ultra (Manual Method)
-    # FIX (Migrasi): Direktori clone diubah dari 'KernelSU/'
-    # menjadi 'SukiSU/' agar namespace konsisten dengan SukiSU Ultra.
     # ══════════════════════════════════════════════════════════
 
     - name: 💉 Clone SukiSU Ultra source
@@ -116,7 +114,6 @@ jobs:
         cd kernel
 
         echo "▶ Cloning SukiSU Ultra repository..."
-        # FIX (Migrasi): Clone ke direktori 'SukiSU/' bukan 'KernelSU/'
         if ! git clone --depth=1 \
           https://github.com/SukiSU-Ultra/SukiSU-Ultra SukiSU; then
           echo "❌ Gagal clone SukiSU Ultra repository!"
@@ -126,8 +123,6 @@ jobs:
 
         echo "▶ Creating symlink (relative path)..."
         cd drivers
-        # FIX (Migrasi): Path diupdate dari '../KernelSU/kernel'
-        # menjadi '../SukiSU/kernel' sesuai nama direktori baru
         ln -sf ../SukiSU/kernel kernelsu
         cd ..
 
@@ -162,8 +157,6 @@ jobs:
 
         echo "▶ Patching drivers/Kconfig..."
         if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
-          # FIX (Bad Practice): Gunakan sed dengan fallback echo untuk robustness
-          # Coba insert sebelum 'endmenu', jika gagal append ke akhir file
           if grep -q '^endmenu' drivers/Kconfig; then
             sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
             echo "  ✅ Added kernelsu to Kconfig (via sed before endmenu)"
@@ -182,8 +175,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════
     # STEP 4: Apply Manual Hooks
-    # FIX (Bug): Gunakan path absolut $GITHUB_WORKSPACE agar
-    # apply_hooks.py dan kernel dir ditemukan dengan benar
     # ══════════════════════════════════════════════════════════
 
     - name: 🔧 Apply kernel hooks
@@ -191,8 +182,6 @@ jobs:
         echo "▶ Running apply_hooks.py..."
         echo ""
 
-        # FIX (Bug): Gunakan path absolut — scripts/ ada di repo root,
-        # bukan di dalam direktori kernel
         SCRIPT="$GITHUB_WORKSPACE/scripts/apply_hooks.py"
         KERNEL_DIR="$GITHUB_WORKSPACE/kernel"
 
@@ -243,8 +232,16 @@ jobs:
 
     # ══════════════════════════════════════════════════════════
     # STEP 5: Configure Kernel
-    # FIX: Semua variabel build sudah di-set via job-level env:
-    # Tidak perlu re-export, hanya referensi langsung
+    #
+    # FIX #1 (ROOT CAUSE): merge_config.sh dipanggil dengan cara
+    #   yang benar: eksekusi dari kernel root dir, gunakan flag -O
+    #   untuk mengarahkan output ke out/, dan pass ARCH + compiler
+    #   vars agar scripts/as-version.sh bisa menemukan assembler.
+    #
+    # FIX #2 (ROOT CAUSE): Tambahkan --enable CONFIG_KPROBES dan
+    #   CONFIG_EXT4_FS sebelum olddefconfig. CONFIG_KSU punya
+    #   `depends on KPROBES && EXT4_FS` — tanpa ini, Kconfig resolver
+    #   PASTI mematikan CONFIG_KSU secara otomatis saat olddefconfig.
     # ══════════════════════════════════════════════════════════
 
     - name: 🏗️ Configure kernel
@@ -279,11 +276,24 @@ jobs:
 
         if [ -n "$TIMELM_CFG" ]; then
           echo "  Using: $TIMELM_CFG"
-          # FIX (Bug): Hilangkan flag -m agar merge_config.sh
-          # menulis hasil merge ke out/.config secara lengkap
-          KCONFIG_CONFIG=out/.config ./scripts/kconfig/merge_config.sh \
+
+          # FIX #1: Gunakan flag -O untuk redirect output ke out/.config
+          # dan eksekusi dari kernel root (CWD sudah benar: `cd kernel` di atas).
+          # Flag -O memastikan merge_config.sh memanggil:
+          #   make O=out alldefconfig
+          # bukan bare `make alldefconfig`, sehingga path scripts/ diresolve
+          # relatif terhadap kernel root, bukan direktori out/.
+          ./scripts/kconfig/merge_config.sh \
+            -O out \
             out/.config \
             "$TIMELM_CFG"
+
+          MERGE_EXIT=$?
+          if [ $MERGE_EXIT -ne 0 ]; then
+            echo "⚠️  merge_config.sh returned exit $MERGE_EXIT"
+            echo "   (Warning tentang 'Value not in final .config' adalah normal"
+            echo "    jika config tersebut punya unmet dependency — bukan fatal error)"
+          fi
         else
           echo "  ⚠️  timelm.config tidak ditemukan, skip merge"
           echo "     Build akan tetap jalan dengan kona-perf_defconfig"
@@ -294,11 +304,32 @@ jobs:
         echo "  [3/3] Enable SukiSU Ultra configs"
         echo "════════════════════════════════════════"
 
-        # FIX (Migrasi): Aktifkan config SukiSU Ultra secara lengkap
-        ./scripts/config --file out/.config \
-          --enable CONFIG_KSU \
-          --enable CONFIG_OVERLAY_FS
+        # FIX #2: Enable SEMUA dependency CONFIG_KSU terlebih dahulu.
+        #
+        # Urutan WAJIB:
+        #   1. KPROBES       ← dependency langsung CONFIG_KSU
+        #   2. EXT4_FS       ← dependency langsung CONFIG_KSU
+        #   3. OVERLAY_FS    ← dibutuhkan untuk mount namespace overlay
+        #   4. MODULES       ← agar KSU bisa dicompile sebagai module (tristate)
+        #   5. CONFIG_KSU    ← baru aktifkan setelah semua dep terpenuhi
+        #
+        # Jika urutan ini tidak diikuti, `make olddefconfig` akan
+        # mematikan CONFIG_KSU secara silent karena dep tidak terpenuhi.
 
+        ./scripts/config --file out/.config \
+          --enable CONFIG_KPROBES \
+          --enable CONFIG_HAVE_KPROBES \
+          --enable CONFIG_KPROBE_EVENTS \
+          --enable CONFIG_EXT4_FS \
+          --enable CONFIG_MODULES \
+          --enable CONFIG_MODULE_UNLOAD \
+          --enable CONFIG_OVERLAY_FS \
+          --enable CONFIG_KSU
+
+        # FIX: Jalankan olddefconfig SETELAH semua --enable di atas,
+        # bukan sebelumnya. olddefconfig hanya mengisi missing configs
+        # dengan default — ia akan memvalidasi dependency dan mematikan
+        # option yang depnya tidak terpenuhi.
         make O=out ARCH=arm64 \
           CC=clang \
           CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -309,43 +340,53 @@ jobs:
         echo ""
         echo "▶ Verifying SukiSU Ultra configs..."
 
-        # FIX (Migrasi): Cek CONFIG_KSU sebagai primary SukiSU Ultra config
-        if grep -qE '^CONFIG_KSU=y' out/.config; then
-          echo "  ✅ CONFIG_KSU=y (SukiSU Ultra AKTIF)"
+        # Cek CONFIG_KSU — bisa =y (built-in) atau =m (module), keduanya valid
+        KSU_VAL=$(grep -E '^CONFIG_KSU=' out/.config | cut -d= -f2)
+        if [ "$KSU_VAL" = "y" ] || [ "$KSU_VAL" = "m" ]; then
+          echo "  ✅ CONFIG_KSU=${KSU_VAL} (SukiSU Ultra AKTIF)"
         else
-          echo "  ❌ CONFIG_KSU tidak aktif!"
+          echo "  ❌ CONFIG_KSU tidak aktif! (nilai: '${KSU_VAL}')"
           echo ""
-          echo "Debugging info:"
-          echo "1. Kconfig integration:"
-          grep 'kernelsu' drivers/Kconfig || echo "   TIDAK ADA!"
+          echo "══ Debugging info ══"
+          echo ""
+          echo "1. Kconfig integration check:"
+          grep 'kernelsu' drivers/Kconfig || echo "   TIDAK ADA di drivers/Kconfig!"
           echo ""
           echo "2. SukiSU Kconfig file:"
           ls -la drivers/kernelsu/Kconfig || echo "   FILE TIDAK ADA!"
           echo ""
-          echo "3. Config dependency check:"
-          grep -A10 'config KSU' drivers/kernelsu/Kconfig || echo "   TIDAK BISA DIBACA!"
+          echo "3. CONFIG_KSU dependency check:"
+          grep -A5 'config KSU' drivers/kernelsu/Kconfig || echo "   TIDAK BISA DIBACA!"
           echo ""
-          echo "4. Current .config status:"
-          grep -i 'ksu\|kernelsu\|sukisu' out/.config || echo "   TIDAK ADA MENTION!"
+          echo "4. Dependency fulfillment check:"
+          echo "   CONFIG_KPROBES    = $(grep '^CONFIG_KPROBES=' out/.config || echo 'NOT SET')"
+          echo "   CONFIG_EXT4_FS    = $(grep '^CONFIG_EXT4_FS=' out/.config || echo 'NOT SET')"
+          echo "   CONFIG_MODULES    = $(grep '^CONFIG_MODULES=' out/.config || echo 'NOT SET')"
+          echo ""
+          echo "5. Current .config KSU-related lines:"
+          grep -i 'ksu\|kernelsu\|sukisu\|kprobes' out/.config || echo "   TIDAK ADA MENTION!"
           exit 1
         fi
 
         echo ""
         echo "Other important configs:"
-        grep '^CONFIG_MODULES=' out/.config || echo "  CONFIG_MODULES not set"
+        grep '^CONFIG_MODULES='    out/.config || echo "  CONFIG_MODULES not set"
+        grep '^CONFIG_KPROBES='    out/.config || echo "  CONFIG_KPROBES not set"
+        grep '^CONFIG_EXT4_FS='    out/.config || echo "  CONFIG_EXT4_FS not set"
         grep '^CONFIG_OVERLAY_FS=' out/.config || echo "  CONFIG_OVERLAY_FS not set"
 
     # ══════════════════════════════════════════════════════════
     # STEP 6: Build Kernel
+    #
+    # FIX: Pisahkan PIPESTATUS capture dari `|| true` pattern.
+    # Dengan `set -euo pipefail`, konstruk `cmd | tee ... || true`
+    # menyebabkan PIPESTATUS[0] selalu jadi 0 atau tidak terdefinisi
+    # karena `|| true` menelan exit code pipe sebelumnya.
     # ══════════════════════════════════════════════════════════
 
     - name: 🔨 Compile kernel
       run: |
         cd kernel
-
-        # FIX (Bad Practice): set -euo pipefail untuk error handling global
-        # PIPESTATUS digunakan untuk logging tanpa bergantung pada set -e saja
-        set -euo pipefail
 
         BUILD_START=$(date +%s)
 
@@ -359,16 +400,24 @@ jobs:
         echo "════════════════════════════════════════"
         echo ""
 
-        # Gunakan timeout agar tidak hang tak terbatas
+        # FIX: Jangan gunakan set -e di sini agar kita bisa capture
+        # exit code secara eksplisit dan berikan diagnostik yang baik.
+        # Pisahkan make dan tee: jalankan make dulu, simpan exitcode,
+        # lalu tee hanya untuk logging (exit code make tidak terpengaruh tee).
+        set -o pipefail
+
         timeout 90m make O=out ARCH=arm64 \
           CC=clang \
           CLANG_TRIPLE=aarch64-linux-gnu- \
           CROSS_COMPILE=aarch64-linux-gnu- \
           CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
           -j$(nproc) \
-          2>&1 | tee build.log || true
+          2>&1 | tee build.log
 
-        BUILD_EXIT=${PIPESTATUS[0]:-1}
+        # Dengan set -o pipefail, jika make gagal, exit code pipe adalah
+        # exit code make (bukan tee). Simpan sebelum hilang.
+        BUILD_EXIT=${PIPESTATUS[0]}
+
         BUILD_END=$(date +%s)
         BUILD_TIME=$(( BUILD_END - BUILD_START ))
 
@@ -401,8 +450,6 @@ jobs:
             echo "▶ First error in build.log:"
             echo "─────────────────────────────────────"
 
-            # FIX (Bad Practice): Regex lebih presisi untuk C compiler
-            # dan make errors, hindari false positive dari -Werror warnings
             ERRLINE=$(grep -n \
               -E '^[^:]+\.(c|h|S):[0-9]+:[0-9]+: error:|make\[[0-9]+\]: \*\*\*|No space left|ld\.lld: error' \
               build.log | head -1 | cut -d: -f1)
@@ -447,8 +494,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════
     # STEP 7: Create Flashable ZIP
-    # FIX (Migrasi): Device name list diperlengkap untuk LG V60
-    # FIX (Bug): DTB copy menggunakan check eksplisit sebelum find
     # ══════════════════════════════════════════════════════════
 
     - name: 📦 Create AnyKernel3 flashable ZIP
@@ -460,8 +505,6 @@ jobs:
 
         echo "▶ Configuring for LG V60 ThinQ (timelm)..."
 
-        # FIX (Migrasi/Security): Lengkapi device names LG V60
-        # agar device check tidak gagal di unit dengan prop yang berbeda
         sed -i 's|do\.devicecheck=.*|do.devicecheck=1|' anykernel.sh
         sed -i 's|device\.name1=.*|device.name1=timelm|' anykernel.sh
         sed -i 's|device\.name2=.*|device.name2=lge_v60|' anykernel.sh
@@ -496,8 +539,6 @@ jobs:
 
         echo "▶ Copying DTBs (if any)..."
         mkdir -p dtbs
-        # FIX (Bug): Check eksplisit direktori DTS sebelum find
-        # mencegah silent error jika direktori tidak ada
         if [ -d "$BOOT/dts" ]; then
           DTB_COUNT=$(find "$BOOT/dts" -name "*.dtb" | wc -l)
           if [ "$DTB_COUNT" -gt 0 ]; then
@@ -535,7 +576,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════
     # STEP 8: Upload Artifacts
-    # FIX (Migrasi): Konsolidasi log artifacts untuk kemudahan debug
     # ══════════════════════════════════════════════════════════
 
     - name: ⬆️ Upload kernel ZIP
@@ -546,7 +586,6 @@ jobs:
         retention-days: 7
         compression-level: 0
 
-    # FIX (Migrasi/Bad Practice): Konsolidasikan semua logs ke satu artifact
     - name: ⬆️ Upload build logs & config
       if: always()
       uses: actions/upload-artifact@v4
@@ -560,7 +599,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════
     # STEP 9: Summary
-    # FIX (Migrasi — Kritis): URL Manager diupdate ke SukiSU Ultra
     # ══════════════════════════════════════════════════════════
 
     - name: 📊 Build summary
@@ -589,8 +627,6 @@ jobs:
           echo "   3. Swipe to confirm flash"
           echo "   4. Reboot system"
           echo ""
-          # FIX (Migrasi — KRITIS): URL diupdate ke SukiSU Ultra Manager
-          # URL lama (tiann/KernelSU) adalah upstream KernelSU, BUKAN SukiSU Ultra
           echo "   5. Install SukiSU Ultra Manager APK:"
           echo "      https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases"
           echo ""
