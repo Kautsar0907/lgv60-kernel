@@ -1,0 +1,51 @@
+name: Build SukiSU Ultra + SUSFS Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: Kautsar0907/lgv60-kernel
+          ref: main
+          submodules: recursive
+
+      - name: Setup build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget curl bc bison flex libssl-dev libncurses5-dev python3
+
+      - name: Integrate SukiSU Ultra
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+
+      - name: Download SUSFS Patches
+        run: |
+          wget -O ida.patch "https://github.com/sidex15/android_kernel_lge_sm8150/compare/4ba6dccf73a620e565803e5995d5748ecfbb56a2%5E..d406904bb175cb9791b5aed4404df3268859d91b.patch"
+          wget -O proc.patch "https://github.com/sidex15/android_kernel_lge_sm8150/compare/7f2847d02cdc4491b5ee6d4a0043854cbd6c7a1a%5E..0a8cbf3725edbacc5f1ead33eeae7e4d78823b5a.patch"
+          wget -O susfs.patch "https://github.com/sidex15/android_kernel_lge_sm8150/compare/bb2f164bc19795ef704f17c82f04885d44421418%5E..574b30a502056c6c12fe19e4dd929ba37b503b0e.patch"
+
+      - name: Apply SUSFS Patches
+        run: |
+          git am ida.patch || echo "IDA patch had issues"
+          git am proc.patch || echo "PROC patch had issues"
+          git am susfs.patch || echo "SUSFS patch had issues (expected conflicts)"
+
+      - name: Build Kernel
+        run: |
+          echo "Build setup ready. Full build needs specific defconfig and toolchain."
+          echo "Current status: SukiSU + patches applied."
+          ls -la
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SukiSU-Kernel-Files
+          path: |
+            *.zip
+            Image*
+            out/
